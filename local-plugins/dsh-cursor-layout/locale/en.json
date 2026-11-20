@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Cursor-style workbench layout",
+    "description": "Three-column DSH workbench: sessions left, the editor/file/browser/terminal/diff-review workbench in the middle, the AI conversation right, plus a header pill (⌘⌥M) that flips back to the native Agent view (centred conversation, workbench hidden). The changed-files bar above the composer matches the composer width."
+  }
+}

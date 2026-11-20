@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>async-ui source chip</title>
+<style>body{font:14px system-ui;padding:24px;max-width:640px}</style>
+<div data-genui id="root" style="display:flex;gap:16px">
+  <div><img id="one" src="/async-img?q=Clodsire%20pokemon&w=900" width="220" height="140"></div>
+  <div><img id="two" src="/async-img?q=Unknown%20thing&w=900" width="220" height="140"></div>
+</div>
+<script>
+  window.__ModuleLoader__ = {
+    load(spec) {
+      const api = spec.factory(function () { return {} })
+      api.apply({ effect: (fn) => fn() })
+    },
+  }
+  const realFetch = window.fetch.bind(window)
+  window.fetch = (input, init) => {
+    const url = String(input)
+    if (!url.includes('/async-img-meta')) return realFetch(input, init)
+    const q = new URL(url, location.href).searchParams.get('q')
+    const body = q === 'Clodsire pokemon'
+      ? { query: q, title: 'Clodsire | Pokémon Wiki | Fandom', page: 'https://pokemon.fandom.com/wiki/Clodsire', engine: 'bing' }
+      : {}
+    return Promise.resolve(new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } }))
+  }
+</script>
+<script src="../client.js?v=src1"></script>
+<script>
+  setTimeout(() => {
+    for (const id of ['one', 'two']) {
+      const img = document.getElementById(id)
+      img.dispatchEvent(new Event('load'))
+    }
+  }, 250)
+</script>

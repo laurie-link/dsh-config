@@ -1,0 +1,5 @@
+# dsh-workbench-sheets：官方右侧 Sidebar（Cursor 视图的中列工作台）里注册
+# 可编辑 CSV/TSV/XLSX 页签；文件读写走本插件 Host 半的本地路由。
+- insert:
+    - id: dsh-workbench-sheets
+      name: 'dsh-workbench-sheets'

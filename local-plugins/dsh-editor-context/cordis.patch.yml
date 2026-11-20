@@ -1,0 +1,5 @@
+# dsh-editor-context：把「当前活动文件 / 打开的文件 / 选区」注入模型运行时上下文，
+# 让 AI 像 Cursor 一样知道自己正在看哪个文件（不改变聊天记录、不需要手动 @）。
+- insert:
+    - id: dsh-editor-context
+      name: 'dsh-editor-context'

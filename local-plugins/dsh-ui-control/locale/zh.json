@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "界面控制",
+    "description": "让 agent 自己切换 IDE / Agent 视图、开关右侧栏，并把网页或文件开在侧栏里。"
+  }
+}

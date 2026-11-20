@@ -1,0 +1,25 @@
+{
+  "name": "dsh-personalization",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ChatGPT-style personalization for DSH: six dropdowns (tone, friendliness, enthusiasm, emoji, visual answers, headings) that render into the system prompt.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "README.md"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

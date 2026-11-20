@@ -1,0 +1,3 @@
+- insert:
+    - id: edit-diff
+      name: 'dsh-edit-diff'

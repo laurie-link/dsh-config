@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>async-ui · basemap wiring</title>
+<style>
+  body { background:#111; color:#eee; font:14px/1.5 ui-sans-serif,system-ui; padding:24px }
+  #log { white-space:pre-wrap; font-family:ui-monospace,Menlo,monospace; font-size:12px; color:#9fe }
+</style>
+</head>
+<body>
+<h1>Basemap wiring check</h1>
+<p>This page fakes the DSH module table. It proves that our client half (1) waits
+for GenUI, (2) fetches /async-img-style, (3) calls setGenuiMapConfig with a style
+object — not a URL.</p>
+<pre id="log"></pre>
+
+<script>
+  // ── fake GenUI module, registered lazily to mimic bundle load order ──────
+  window.__CALLS__ = []
+  const genui = {
+    setGenuiMapConfig(config) {
+      window.__CALLS__.push({
+        kind: 'setGenuiMapConfig',
+        version: config && config.style && config.style.version,
+        layers: config && config.style && Array.isArray(config.style.layers) ? config.style.layers.length : -1,
+        sprite: config && config.style && config.style.sprite,
+        isString: typeof config === 'string',
+      })
+      document.getElementById('log').textContent += 'setGenuiMapConfig(' + JSON.stringify(window.__CALLS__[window.__CALLS__.length - 1]) + ')\n'
+    },
+  }
+  const table = { '@changfenhuang/dsh-genui': undefined }
+  window.__ModuleLoader__ = {
+    load(entry) {
+      // DSH gives every plugin a require that resolves the module table, then
+      // calls apply(ctx) with a real fibre context. Mimic the minimum: effect()
+      // runs the body now and remembers the cleanup.
+      const factory = entry.factory
+      const resolver = (id) => {
+        if (table[id] === undefined) throw new Error('module not loaded: ' + id)
+        return table[id]
+      }
+      // Both faces the real module system exposes: the sync table and the
+      // async import that arrives the graph row first.
+      resolver.async = (id) => new Promise((resolve, reject) => {
+        const wait = (left) => {
+          if (table[id] !== undefined) return resolve(table[id])
+          if (left <= 0) return reject(new Error('cannot resolve ' + id))
+          setTimeout(() => wait(left - 1), 100)
+        }
+        wait(60)
+      })
+      const plugin = factory(resolver)
+      window.__MODULE_LOADED__ = entry.id
+      if (plugin && typeof plugin.apply === 'function') {
+        plugin.apply({ effect: (body) => { window.__CLEANUPS__ = window.__CLEANUPS__ || []; window.__CLEANUPS__.push(body()) } })
+        window.__APPLIED__ = true
+      }
+    },
+  }
+  // GenUI "arrives" 1.2 s later than us.
+  setTimeout(() => {
+    table['@changfenhuang/dsh-genui'] = genui
+    document.getElementById('log').textContent += 'genui module available\n'
+  }, 1200)
+</script>
+<script src="../client.js?v=map1"></script>
+</body>
+</html>

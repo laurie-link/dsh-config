@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>async-ui zoom harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:28px; font:15px/1.6 -apple-system,"PingFang SC",sans-serif;
+         background:#0f1115; color:#e6e8ee; }
+  .case { max-width:520px; margin:0 auto 22px; background:#171a21; border:1px solid #262b36;
+          border-radius:14px; padding:18px; }
+  .case > .name { font-size:12px; color:#7d879a; margin-bottom:10px; }
+  img { width:180px; border-radius:10px; display:block; }
+  /* the gallery thumbnail GenUI ships: the picture sits inside a button */
+  [data-genui] button { border:0; padding:0; background:none; cursor:zoom-in; }
+</style></head>
+<body>
+  <!-- Case A: a plain `image` node inside a card -> my overlay should open -->
+  <div class="case">
+    <div class="name">A · 普通 image 节点（应放大）</div>
+    <div data-genui id="case-a"><img id="a" src="/test/shots/1-skeleton.png" alt="骨架屏"></div>
+  </div>
+
+  <!-- Case B: an image-group thumbnail -> GenUI owns the click, no overlay -->
+  <div class="case">
+    <div class="name">B · image-group 缩略图（不叠加自建灯箱）</div>
+    <div data-genui id="case-b"><button type="button" aria-haspopup="dialog" id="b-btn"><img id="b" src="/test/shots/2-loaded.png" alt="落地"></button></div>
+  </div>
+
+  <!-- Case C: an image outside GenUI -> untouched -->
+  <div class="case">
+    <div class="name">C · 非 GenUI 区域的图（不接管）</div>
+    <img id="c" src="/test/shots/1-skeleton.png" alt="外部">
+  </div>
+
+  <script>
+    window.__ModuleLoader__ = {
+      load({ factory }) {
+        const mod = factory(function () { return {} })
+        mod.apply({ effect(fn) { fn() } })
+      },
+    }
+  </script>
+  <script src="/client.js?v=zoom1"></script>
+</body></html>

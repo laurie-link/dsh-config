@@ -1,0 +1,1079 @@
+/**
+ * `@local/dsh-async-ui` — AsyncImage semantics for DSH GenUI.
+ *
+ * The problem this solves: a GenUI `image` node needs a URL the browser can
+ * load, but the model often only knows a *description* ("周报封面：赛博朋克夜景").
+ * ChatGPT's Intelligent UI solves it by letting the model write
+ * `<AsyncImage query="…"/>` and having the HOST resolve the tag into a real
+ * `content_url` before the tree reaches the renderer.
+ *
+ * This plugin does the same one layer up and reuses GenUI's renderer:
+ *
+ *   model → render_ui({ spec with image nodes carrying "query" })
+ *         → execute() resolves every description NOW (prefetch, ~1 s cold)
+ *         → presentationMeta() rewrites each such node to
+ *           { src: "/async-img?q=…&w=900" } — same process, warm cache
+ *         → the spec lands in the tool result `meta`
+ *         → GenUI's OWN keyed toolview (key "render_ui") draws the card
+ *         → the browser hits /async-ui-img, gets a 302 in ~1 ms, pulls the
+ *           picture from the (already chosen) source while the Client half
+ *           holds a shimmering slot open for it.
+ *
+ * Why own the route instead of reusing `/img-resolve`: that route lives in a
+ * different plugin module instance, so its cache cannot be warmed from here —
+ * every async image would pay the full search inside the browser's request.
+ * Same process + same Map means the prefetch actually lands.
+ *
+ * Pairing requirement: GenUI must stop registering its own `render_ui` tool
+ * (config `renderUiTool: false`) so this plugin can own the name and reuse
+ * GenUI's toolview key. Nothing else about GenUI changes.
+ *
+ * @module @local/dsh-async-ui
+ */
+
+import { execFile } from 'node:child_process'
+import { statSync } from 'node:fs'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { homedir, tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
+
+/** Our own late-resolving image route (warm cache lives behind it). */
+const ROUTE = '/async-img'
+
+/** The standalone resolver's route: fallback when our route cannot register. */
+const FALLBACK_ROUTE = '/img-resolve'
+
+/** Map basemap style served to the client half (GenUI's map node ships with no
+ * tiles at all — `setGenuiMapConfig` wants an INLINE style, never a URL). */
+const STYLE_ROUTE = '/async-img-style'
+const META_ROUTE = '/async-img-meta'
+const STYLE_FILE = new URL('../assets/liberty-style.json', import.meta.url)
+
+/** Default cap on resolved images per card — a gallery, not a scrape. */
+const DEFAULT_MAX_IMAGES = 12
+
+/** Where an async image node's description lives. */
+const QUERY_KEYS = ['query', 'imageQuery', 'describe']
+
+/** Resolver package whose search + cache we borrow. */
+const RESOLVER_PKG = '@local/dsh-image-resolver'
+
+/** How long a prefetched URL is considered fresh. */
+const URL_TTL_MS = 20 * 60 * 1000
+
+/** Hard cap on how long a tool call waits for prefetch; the card still renders after. */
+const PREFETCH_BUDGET_MS = 4000
+
+/**
+ * Width requested from the resolver. It is sent explicitly (`w=`) on every URL
+ * so the route and the prefetch use the SAME cache key — the resolver keys its
+ * cache on `width|engine|sources|query`, and a mismatch there turns every
+ * prefetch into a cache miss.
+ */
+const DEFAULT_WIDTH = 900
+
+/** Longest description accepted from a URL, in characters. */
+const MAX_QUERY = 300
+const MAX_SUBJECT = 200
+
+/**
+ * Bytes are PROXIED, not redirected.
+ *
+ * A 302 hands the browser a third-party URL, and those fail in ways the host
+ * cannot see: hotlink protection (403 to a foreign Referer), quotes or spaces
+ * in the CDN path, redirect hops Chromium refuses. Fetching here makes the
+ * route the only thing the page talks to, so a candidate can be checked and
+ * replaced before anything is painted.
+ */
+const PROXY_TIMEOUT_MS = 9000
+
+/** Refuse absurd upstream bodies (a 4K PNG is still ~9 MB). */
+const PROXY_MAX_BYTES = 12 * 1024 * 1024
+
+/** Present as the page's own browser; several CDNs 403 an empty UA. */
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+
+/** Square-crop side used when `?fit=square` carries no `?size=`. */
+const SQUARE_DEFAULT = 160
+
+/** Version of the candidate matcher; part of the byte cache key. */
+const BYTE_CACHE_VERSION = 7
+
+/** Lower bound: below a few hundred bytes it is a sprite or an error page. */
+const MIN_IMAGE_BYTES = 512
+
+/** Short side under this is an icon/pixel-mush, not a usable illustration. */
+const MIN_IMAGE_SIDE = 150
+
+/** Beyond this aspect ratio the result is a banner or a divider strip. */
+const MAX_IMAGE_RATIO = 3.6
+
+/**
+ * Candidate plans, tried in order when one source is unreachable.
+ *
+ * Baidu's CDN answers 403 to a lot of hotlinked results, so the fallbacks
+ * switch the *source* rather than retrying the same search: bing/360 results
+ * live on hostnames that do not check Referer, and Wikimedia never does.
+ */
+const FALLBACK_PLANS = [
+  {},
+  { engine: 'bing' },
+  { engine: 'so360' },
+  { sources: ['wikimedia'] },
+]
+
+/** English queries do not belong in Baidu, Chinese ones do not belong in Bing. */
+const CJK_TEXT = /[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]/
+
+/**
+ * Search plans ordered by the language of the query.
+ *
+ * A mixed first plan is what produced a street photo for "Mega Houndoom":
+ * Baidu answers English entity queries with unrelated blog posts, and the
+ * resolver used to take the first hit from any engine.
+ */
+function plansFor(query) {
+  if (CJK_TEXT.test(query)) {
+    return [{ engine: 'baidu' }, { engine: 'so360' }, { sources: ['wikimedia'] }, {}]
+  }
+  /* International Bing first through the configured proxy; it avoids the
+     zh-CN Bing results that previously confused English entity names. */
+  return [
+    { engine: 'bing' },
+    { engine: 'duckduckgo' },
+    { engine: 'yandex' },
+    { sources: ['wikimedia', 'openverse'] },
+  ]
+}
+
+/** Proxied bytes, so a repaint does not re-download: full key -> { buf, type, at }. */
+const byteCache = new Map()
+
+/** How long proxied bytes stay hot. */
+const BYTE_TTL_MS = 10 * 60 * 1000
+
+/** Keep the byte cache small enough to live in the plugin process. */
+const MAX_BYTE_ENTRIES = 80
+
+export const name = '@local/dsh-async-ui'
+
+/**
+ * `tools` and `webServer` are both optional (a host without either should
+ * still load), so they are probed with `ctx.inject` instead of declared.
+ */
+export const inject = ['systemPrompt']
+
+/**
+ * Prompt section: how the model is expected to place an image it cannot cite.
+ *
+ * This competes with the image-hunt skill, whose description says "找图/配图"
+ * — a model reading that will download files unless this says, in as many
+ * words, that a picture inside the reply is a different job from fetching
+ * assets. Keep the "download vs display" split explicit.
+ */
+const SECTION_TEXT = [
+  '## 配图策略：图片是内容的一部分，不是可有可无的装饰',
+  '优先级：本节是图片专用规则，优先于 GenUI/skill 中关于“无组件配额”“默认无卡”“删掉组件会不会更费劲”的通用布局建议。那些建议只用于避免无意义的容器、图表和装饰性组件，不得用来压低真实对象的配图密度。',
+  '回答涉及可识别、具体且有视觉形态的对象时，默认主动配图，不要等用户明确说“配图”或“展示图片”。先识别回答中的核心视觉实体，再决定图片；图片属于内容素材，不是为了好看而额外添加的 UI。',
+  '核心视觉实体包括：宝可梦及其不同形态、人物/角色、生物、产品/设备/完整型号、地点/建筑、食物、车辆、游戏/影视作品、艺术作品、活动现场，以及读者需要辨认的道具或场景。',
+  '',
+  '### 配图密度：先定目标，再检查是否漏图',
+  '配图数量没有固定的 1–4 张或 2–5 张上限。短回答通常 1–3 张；常规解释、比较或攻略通常 3–6 张；长篇研究、教程、多章节回答通常 6–12 张，内容需要时可以更多。数量按视觉实体、子主题和章节计算，不按段落机械凑数。',
+  '每个被认真比较、推荐、排名或列入候选清单的对象至少 1 张独立图片；不要用一张拼图、封面或代表图代替多个对象。',
+  '对重要对象不要只满足“每个实体 1 张”就停止：当外观、形态、实际使用场景、游戏内表现、地图/环境、关键细节或前后状态能提供不同信息时，再为该对象增加 1–2 张不同图片。不同图片必须有不同用途，不能只是同一张图的重复搜索。',
+  '长篇回答按主要章节分别配图：每个有独立视觉主题的章节通常至少 1 组图；一组可以包含多张独立图片，最多 24 张。不要把整篇回答的图片全部压缩成开头的一组或结尾的一组。',
+  '以上是配图密度目标，不是要求给抽象概念、纯数字、代码、报错、短翻译或没有可核对视觉对象的内容硬塞图片。用户明确要求纯文字时也不配图。',
+  '输出前必须做一次“漏图检查”：逐段检查新出现的核心实体、被比较的候选项、重要形态和新的视觉子主题。只要图片能帮助读者识别、区分或理解对象，就应补上对应图片；不能因为已经有一张总览图、文字已经解释清楚，或某一主题已经有一个 image-group 就停止配图。只有重复提及、图片对理解没有帮助，或找不到通过核验的图片时才跳过。',
+  '',
+  '### 图片 URL：把检索词和主体身份分开',
+  '在 image、image-group、compare 的 src 中使用 /async-img?q=<搜索词>&s=<精确主体>&w=900。q 是给搜索引擎的简短检索词；s 是必须核对的 canonical subject。每张具体实体图片都必须提供 s，不要只写 q。',
+  's 只写准确主体名，不要塞入泛化类别词或一长串画面描述；q 写主体原名 + 必要的类别/场景限定。主体有版本、形态、型号或地区差异时，必须把区别写进 s，不能只写大类。',
+  '- 宝可梦：每个被比较或推荐的宝可梦分别配图；Mega、Shadow、Dynamax、Gigantamax、Origin、Crowned、Black Kyurem、White Kyurem 等形态必须写全，不能用普通形态或相近形态替代。例如 q=Mega Houndoom Pokemon official artwork，s=Mega Houndoom。',
+  '- 游戏/影视作品：q=Grand Theft Auto VI official artwork，s=Grand Theft Auto VI；不要把 GTA V 的素材当 GTA VI。',
+  '- 地点/建筑：q=深圳市民中心 建筑 外观，s=深圳市民中心；优先找能核对到该地点的实景图。',
+  '- 产品/设备：把品牌、完整型号和代际写进 s，不要拿外观相似的上一代产品代替。',
+  '- 中文独有事物用中文原名；外国作品、人物、角色、品牌和地点用官方原名；日文作品优先用官方日文名称。不要用容易产生歧义的直译名。',
+  '- q 可以增加 official artwork、in-game screenshot、exterior、product photo 等限定词，但不要堆砌同义词或把完整问句当检索词。',
+  '',
+  '### 图片布局：跟着正文走，不要只在末尾放一组图',
+  '- 单个核心对象：在第一次重点介绍它的段落附近放一张 image。',
+  '- 同一小节有 2–6 个相关对象：优先用一个 image-group，每个对象一个独立 item；每个 item 都要有自己的 q 和 s。对象分属不同章节时，分别在各章节放 image-group，不要把整篇文章的图片全部塞进同一个大图库。',
+  '- 比较、推荐或排名时，image-group 应覆盖所有核心候选对象；不要用一张拼图、一个通用物种图或一张代表图代替逐项配图。',
+  '- 一篇图文回答应按阅读顺序交错组织：该段文字 → 对应 image/image-group → 下一段文字 → 下一组图片。图片紧邻它说明的对象；不要把所有文字写完后才在末尾补图。',
+  '- 前后状态或两个形态必须并排比较时用 compare；普通的多个独立对象用 image-group。',
+  '- caption 写准确名称或必要的形态区别；如果 caption 已经显示名称，不要再用 alt 重复标注。',
+  '- 同一实体在回答中重复出现时不要重复配图；但如果比较的是不同 Mega/Shadow/Dynamax/Gigantamax/Origin/Crowned 形态，或不同产品代际，则每个不同形态/型号都要单独配图。',
+  '',
+  '### 取图和失败规则',
+  '优先官方图、官方图鉴、可信百科或可靠媒体页面；搜索结果标题必须能核对到 s 中的主体。泛化类别词命中、只有相似名称、形态不一致、来源页不可信，都不能当作验证通过。',
+  '宿主会自动搜索、代理下载并检查图片格式/尺寸；不要先调用 image_hunt 下载文件，不要自己猜 URL，不要在正文解释取图过程。只有用户明确要求下载、保存素材或挑选一批原始文件时，才使用 image_hunt / image_download。',
+  '如果一组中的某一张图未通过验证，只省略那一张并保留其他通过验证的图片；不要因此放弃整组，也不要用随机图补位。找不到可靠图片时宁可省略该图，不放占位卡、不写“图片无法加载”，也不要为了凑数量降低匹配标准。',
+].join('\n')
+
+
+/** True once our route is serving; meta falls back to /img-resolve when false. */
+let routeReady = false
+
+/** Resolved URLs for the route to answer instantly: `width|query -> { url, at }`. */
+const urlCache = new Map()
+/* What page each resolved picture came from, so the client can show a source
+   chip: a picture nobody can trace is a picture nobody can check. */
+const sourceCache = new Map()
+
+/** One shared promise for the resolver module (undefined until first use). */
+let resolverState = { stamp: '', promise: undefined }
+
+/** Read a non-empty string. */
+function pickString(value) {
+  return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined
+}
+
+/** Cache key shared by the prefetch, the route and the resolver's own cache. */
+function cacheKey(width, query, engine, subject = query) {
+  return String(width) + '|' + (engine ?? '') + '|' + subject + '|' + query
+}
+
+function sourceKey(width, query, subject = query) {
+  return String(width) + '|' + subject + '|' + query
+}
+
+/** Clamp `?w=` the way the resolver does, so both sides agree on the key. */
+function clampWidth(raw) {
+  const value = Number.parseInt(String(raw ?? ''), 10)
+  if (!Number.isFinite(value)) return DEFAULT_WIDTH
+  return Math.min(2048, Math.max(320, value))
+}
+
+/** Build the async image URL for one description. */
+function resolveUrl(query, options, subject = query) {
+  const width = options.width ?? DEFAULT_WIDTH
+  const base = routeReady ? ROUTE : FALLBACK_ROUTE
+  const params = new URLSearchParams({ q: query, s: subject, w: String(width) })
+  if (options.engine) params.set('engine', options.engine)
+  return base + '?' + params.toString()
+}
+
+/**
+ * Import the resolver package so searches and caching are its concern, not
+ * ours.
+ *
+ * The plugin is linked into the profile, so pnpm puts a symlink in the
+ * profile's `node_modules`; resolving from there works even though this
+ * package does not declare it as a dependency (same trick the resolver uses
+ * for `dsh-image-hunt`). A profile without the resolver simply gets a route
+ * that 302s to whatever exists, or a 404.
+ */
+function resolverTarget() {
+  const bases = [
+    process.env.DSH_PROFILE_DIR,
+    join(homedir(), '.dsh', 'profiles', 'desktop'),
+    process.cwd(),
+  ].filter(base => typeof base === 'string' && base !== '')
+  for (const base of bases) {
+    try {
+      const require = createRequire(join(base, 'package.json'))
+      const path = require.resolve(RESOLVER_PKG)
+      return { url: pathToFileURL(path).href, stamp: String(statSync(path).mtimeMs) }
+    } catch {
+      /* try the next base */
+    }
+  }
+  return undefined
+}
+
+/**
+ * Load the resolver, re-importing it when the file on disk changes.
+ *
+ * Node keys ES modules by specifier, so a plain `import()` pins the first
+ * version for the life of the process: editing the resolver and reloading this
+ * plugin would keep running the old code. The mtime query gives each version
+ * its own specifier, which is what makes "edit → reload → test" work without
+ * restarting DSH.
+ */
+function loadResolver() {
+  let target
+  try {
+    target = resolverTarget()
+  } catch {
+    target = undefined
+  }
+  if (target === undefined) return Promise.resolve(undefined)
+  const stamp = `${target.url}@${target.stamp}`
+  if (resolverState.promise !== undefined && resolverState.stamp === stamp) return resolverState.promise
+  resolverState = {
+    stamp,
+    promise: import(`${target.url}?v=${encodeURIComponent(target.stamp)}`).catch(() => undefined),
+  }
+  return resolverState.promise
+}
+
+/** Cache hit for one description, or undefined when stale/absent. */
+function cachedUrl(width, query, engine, subject = query) {
+  const key = cacheKey(width, query, engine, subject)
+  const hit = urlCache.get(key)
+  if (hit === undefined) return undefined
+  if (hit.verified !== true || Date.now() - hit.at > URL_TTL_MS) {
+    urlCache.delete(key)
+    return undefined
+  }
+  return hit
+}
+
+/** Forget one verified candidate so the next request searches again. */
+function forgetUrl(width, query, engine, subject = query) {
+  urlCache.delete(cacheKey(width, query, engine, subject))
+}
+
+/**
+ * Ask the resolver for a candidate whose title/page actually mentions the
+ * subject. Older resolver builds do not export this, hence the feature check.
+ */
+async function resolveVerified(query, width, engine, sources, extra) {
+  const module = await loadResolver()
+  if (module === undefined || typeof module.resolveImageCandidate !== 'function') return undefined
+  const opts = extra === undefined ? {} : { ...extra }
+  if (engine !== undefined) opts.engine = engine
+  if (Array.isArray(sources) && sources.length > 0) opts.sources = sources
+  return await module.resolveImageCandidate(query, width, opts)
+}
+
+/** Page-bound resolution: the page names the subject, its lead image illustrates it. */
+async function resolveBound(query, subject = query) {
+  const module = await loadResolver()
+  if (module === undefined || typeof module.resolvePageImage !== 'function') return undefined
+  return await module.resolvePageImage(query, { subject })
+}
+
+/** Fetch a candidate URL and apply the requested fit; undefined when unreachable. */
+async function fetchFitted(url, fit, size) {
+  let bytes
+  try {
+    bytes = await fetchCandidate(url)
+  } catch {
+    return undefined
+  }
+  if (fit === 'square' && size !== undefined) {
+    const cropped = await squareCrop(bytes, size)
+    if (cropped !== undefined) bytes = cropped
+  }
+  return bytes
+}
+
+async function resolveOne(query, subject, width, options) {
+  /* Prefetch must use the exact same validator as the live route. The former
+     implementation cached the first raw search hit; a later validation miss
+     could then accidentally serve that unverified image. */
+  for (const plan of plansFor(query)) {
+    const planEngine = plan.engine ?? options.engine
+    const candidate = await resolveVerified(query, width, planEngine, plan.sources, { subject })
+    if (candidate === undefined || typeof candidate.url !== 'string' || !candidate.url.startsWith('http')) continue
+    const entry = {
+      url: candidate.url,
+      title: candidate.title,
+      page: candidate.page,
+      engine: candidate.engine ?? planEngine ?? null,
+      score: candidate.score,
+      verified: true,
+      at: Date.now(),
+    }
+    urlCache.set(cacheKey(width, query, planEngine, subject), entry)
+    if (typeof candidate.title === 'string' && candidate.title !== '') {
+      sourceCache.set(sourceKey(width, query, subject), {
+        query, subject, title: candidate.title, page: candidate.page,
+        engine: entry.engine, at: Date.now(),
+      })
+    }
+    return entry
+  }
+  return undefined
+}
+
+/**
+ * Resolve every description before the card is handed back.
+ *
+ * Without this the browser's first request carries the whole search (0.7–1.5 s
+ * cold) and the user stares at an empty box. Cost is bounded: the tool call
+ * waits at most PREFETCH_BUDGET_MS, and work still in flight keeps filling the
+ * cache for the next card.
+ *
+ * @returns `{ warm, total }` for the tool result line.
+ */
+async function prefetch(queries, options) {
+  const width = options.width ?? DEFAULT_WIDTH
+  let warm = 0
+  const work = Promise.all(queries.map(async (item) => {
+    const query = typeof item === 'string' ? item : item.query
+    const subject = typeof item === 'string' ? item : item.subject ?? item.query
+    if (plansFor(query).some(plan => cachedUrl(width, query, plan.engine ?? options.engine, subject) !== undefined)) {
+      warm += 1
+      return
+    }
+    try {
+      const candidate = await resolveOne(query, subject, width, options)
+      if (candidate !== undefined) warm += 1
+    } catch {
+      /* The live route still gets its own verified search; no raw hit is cached. */
+    }
+  }))
+  await Promise.race([work, new Promise(resolve => { setTimeout(resolve, PREFETCH_BUDGET_MS).unref?.() })])
+  return { warm, total: queries.length }
+}
+
+/**
+ * Rewrite description-carrying image nodes into URL-carrying ones.
+ *
+ * A node is an async image when it has one of QUERY_KEYS and NO explicit
+ * source. It does not need `type: "image"` — image-group `items` and
+ * compare `before`/`after` are bare `{src, alt}` records, so field shape is
+ * the only reliable test across components.
+ *
+ * @param spec - the model-authored GenUI spec (must already be an object).
+ * @param options - `maxImages`, `width`, `engine`.
+ * @returns the rewritten spec plus resolve statistics.
+ */
+export function resolveSpec(spec, options = {}) {
+  const maxImages = Number.isFinite(options.maxImages) ? options.maxImages : DEFAULT_MAX_IMAGES
+  const stats = { resolved: 0, skipped: 0, queries: [] }
+
+  const visit = (value) => {
+    if (value === null || typeof value !== 'object') return value
+    if (Array.isArray(value)) return value.map(visit)
+    const out = {}
+    for (const [key, child] of Object.entries(value)) out[key] = visit(child)
+    const query = QUERY_KEYS.map(key => pickString(value[key])).find(Boolean)
+      ?? QUERY_KEYS.map(key => pickString(out[key])).find(Boolean)
+    const subject = pickString(value.subject) ?? pickString(out.subject) ?? query
+    const hasSource = pickString(out.src) !== undefined
+      || pickString(out.image) !== undefined
+      || pickString(out.poster) !== undefined
+    if (query !== undefined && !hasSource) {
+      if (stats.resolved >= maxImages) {
+        stats.skipped += 1
+        return out
+      }
+      out.src = resolveUrl(query, options, subject)
+      for (const key of QUERY_KEYS) delete out[key]
+      delete out.subject
+      stats.resolved += 1
+      if (!stats.queries.some(item => item.query === query && item.subject === subject)) {
+        stats.queries.push({ query, subject })
+      }
+    }
+    return out
+  }
+
+  return { spec: visit(spec), stats }
+}
+
+/** Profile bases that may hold `jimp`, same lookup order the resolver uses. */
+function profileBases() {
+  return [
+    process.env.DSH_PROFILE_DIR,
+    join(homedir(), '.dsh', 'profiles', 'desktop'),
+    process.cwd(),
+  ].filter(base => typeof base === 'string' && base !== '')
+}
+
+/** One shared import of jimp; a profile without it just loses square crops. */
+let jimpPromise
+function loadJimp() {
+  if (jimpPromise === undefined) {
+    jimpPromise = (async () => {
+      for (const base of profileBases()) {
+        try {
+          const require = createRequire(join(base, 'package.json'))
+          return await import(require.resolve('jimp'))
+        } catch {
+          /* try the next base */
+        }
+      }
+      return undefined
+    })()
+  }
+  return jimpPromise
+}
+
+/** Trust magic bytes over a lying Content-Type. */
+function sniffType(buf, hint) {
+  if (buf[0] === 0xff && buf[1] === 0xd8) return 'image/jpeg'
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return 'image/png'
+  if (buf.subarray(0, 3).toString('ascii') === 'GIF') return 'image/gif'
+  if (buf.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp'
+  if (buf.subarray(0, 2).toString('ascii') === 'BM') return 'image/bmp'
+  return typeof hint === 'string' && hint.startsWith('image/') ? hint : undefined
+}
+
+/** Fetch one candidate and prove it really decodes as an image. */
+async function fetchCandidate(url) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PROXY_TIMEOUT_MS)
+  try {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      signal: controller.signal,
+      headers: {
+        'user-agent': BROWSER_UA,
+        /* A same-origin Referer is what hotlink protection usually wants. */
+        referer: url,
+        accept: 'image/avif,image/webp,image/apng,image/png,image/jpeg,image/*;q=0.8,*/*;q=0.5',
+      },
+    })
+    if (!response.ok) throw new Error(`upstream ${response.status}`)
+    const hint = (response.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
+    if (hint !== '' && !hint.startsWith('image/') && !hint.startsWith('binary/')) {
+      throw new Error(`upstream type ${hint}`)
+    }
+    const buf = Buffer.from(await response.arrayBuffer())
+    if (buf.length < MIN_IMAGE_BYTES) throw new Error(`upstream body ${buf.length}B`)
+    if (buf.length > PROXY_MAX_BYTES) throw new Error(`upstream body ${buf.length}B (too large)`)
+    const type = sniffType(buf, hint)
+    if (type === undefined) throw new Error('upstream body is not an image')
+    /* Reject sprite-sized and banner-shaped results: they read as artifacts. */
+    const jimp = await loadJimp()
+    if (jimp !== undefined) {
+      try {
+        const probe = await jimp.Jimp.read(buf)
+        const shortSide = Math.min(probe.width, probe.height)
+        const ratio = Math.max(probe.width, probe.height) / Math.max(1, shortSide)
+        if (shortSide < MIN_IMAGE_SIDE) throw new Error(`upstream ${probe.width}x${probe.height} too small`)
+        if (ratio > MAX_IMAGE_RATIO) throw new Error(`upstream ${probe.width}x${probe.height} too wide`)
+      } catch (error) {
+        if (String(error).includes('too small') || String(error).includes('too wide')) throw error
+        /* Undecodable by jimp (e.g. WebP): let it through, just without a crop. */
+      }
+    }
+    return { buf, type }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const execFileAsync = promisify(execFile)
+
+/**
+ * Center-crop to a square through macOS `sips`.
+ *
+ * jimp 1.x cannot decode WebP, and WebP is a large share of Chinese search
+ * results, so the platform tool is the fallback rather than shipping a wasm
+ * decoder. `sips` crops from the centre and writes JPEG.
+ */
+async function sipsSquare(bytes, size) {
+  const dir = await mkdtemp(join(tmpdir(), 'async-ui-'))
+  try {
+    const source = join(dir, 'in.img')
+    const scaled = join(dir, 'scaled.jpg')
+    const target = join(dir, 'out.jpg')
+    await writeFile(source, bytes.buf)
+    // `--cropToHeightWidth` is a pixel crop, not a cover: cropping a 1280px
+    // WebP to 200px keeps the centre 200px square, which is a 6x zoom into the
+    // middle of the picture. Scale so the short side equals `size` first, then
+    // the centre crop is the same "cover" jimp does.
+    const { stdout } = await execFileAsync('sips', ['-g', 'pixelWidth', '-g', 'pixelHeight', source])
+    const width = Number(/pixelWidth:\s*(\d+)/.exec(stdout)?.[1])
+    const height = Number(/pixelHeight:\s*(\d+)/.exec(stdout)?.[1])
+    if (width > 0 && height > 0) {
+      const long = Math.round((Math.max(width, height) * size) / Math.min(width, height))
+      if (Math.abs(long - Math.max(width, height)) > 1) {
+        // Convert on the way out: `sips` keeps the source format, and a WebP
+        // destination is not writable ("Can't write format: org.webmproject.webp").
+        await execFileAsync('sips', ['-s', 'format', 'jpeg', '-Z', String(long), source, '--out', scaled])
+        await execFileAsync('sips', ['-s', 'format', 'jpeg', '--cropToHeightWidth', String(size), String(size), scaled, '--out', target])
+        const buf = await readFile(target)
+        if (buf.length < MIN_IMAGE_BYTES) return undefined
+        return { buf, type: 'image/jpeg' }
+      }
+    }
+    await execFileAsync('sips', ['-s', 'format', 'jpeg', '--cropToHeightWidth', String(size), String(size), source, '--out', target])
+    const buf = await readFile(target)
+    if (buf.length < MIN_IMAGE_BYTES) return undefined
+    return { buf, type: 'image/jpeg' }
+  } catch {
+    return undefined
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+}
+
+/** Center-crop to a square so a thumbnail column never staggers. */
+async function squareCrop(bytes, size) {
+  const jimp = await loadJimp()
+  if (jimp !== undefined) {
+    try {
+      const image = await jimp.Jimp.read(bytes.buf)
+      image.cover({ w: size, h: size })
+      const buf = await image.getBuffer('image/jpeg', { quality: 82 })
+      return { buf: Buffer.from(buf), type: 'image/jpeg' }
+    } catch {
+      /* WebP and friends: fall through to the platform tool. */
+    }
+  }
+  if (process.platform === 'darwin') return await sipsSquare(bytes, size)
+  return undefined
+}
+
+/** Park proxied bytes so the next repaint is free. */
+function rememberBytes(key, bytes) {
+  if (byteCache.size >= MAX_BYTE_ENTRIES) {
+    const oldest = byteCache.keys().next().value
+    if (oldest !== undefined) byteCache.delete(oldest)
+  }
+  byteCache.set(key, { ...bytes, at: Date.now() })
+}
+
+function cachedBytes(key) {
+  const hit = byteCache.get(key)
+  if (hit === undefined || Date.now() - hit.at > BYTE_TTL_MS) return undefined
+  return hit
+}
+
+/**
+ * GET /async-img?q=…[&w=900][&engine=baidu][&fit=square][&size=160]
+ *
+ * Proxies the bytes instead of redirecting, so every candidate is checked
+ * before the page sees it and a 403/hotlink/CDN quirk falls through to the
+ * next source instead of painting a broken image.
+ */
+/** Neutral stand-in is gone: an unverified query now answers 404 and the card
+ *  renderer drops the tile (see serveAsyncImage). */
+
+async function serveAsyncImage(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { allow: 'GET, HEAD' })
+    res.end()
+    return
+  }
+  let parsed
+  try {
+    parsed = new URL(req.url ?? '/', 'http://local')
+  } catch {
+    res.writeHead(400)
+    res.end()
+    return
+  }
+  const query = (parsed.searchParams.get('q') ?? '').trim().slice(0, MAX_QUERY)
+  if (query === '') {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('missing ?q= (image description)')
+    return
+  }
+  const subject = (parsed.searchParams.get('s') ?? parsed.searchParams.get('subject') ?? query).trim().slice(0, MAX_SUBJECT)
+  const width = clampWidth(parsed.searchParams.get('w'))
+  const engine = parsed.searchParams.get('engine') ?? undefined
+  const fit = parsed.searchParams.get('fit') === 'square' ? 'square' : undefined
+  const size = fit === 'square'
+    ? Math.min(512, Math.max(48, Number.parseInt(parsed.searchParams.get('size') ?? '', 10) || SQUARE_DEFAULT))
+    : undefined
+  /* Bump when the matcher changes: cached bytes must not outlive a fix. */
+  const byteKey = String(BYTE_CACHE_VERSION) + '|' + width + '|' + (engine ?? '') + '|' + (fit ?? '') + '|' + (size ?? '') + '|' + subject + '|' + query
+
+  let bytes = cachedBytes(byteKey)
+  const fromCache = bytes !== undefined
+  const failures = []
+  let matchTitle
+  let boundPage
+  if (fromCache) {
+    const prior = sourceCache.get(sourceKey(width, query, subject))
+    if (prior !== undefined) {
+      matchTitle = prior.title
+      if (typeof prior.page === 'string' && prior.page.startsWith('http')) boundPage = prior.page
+    }
+  }
+
+  if (bytes === undefined) {
+    if (bytes === undefined)
+    for (const plan of plansFor(query)) {
+      const planEngine = plan.engine ?? engine
+      let url
+      let verifiedTitle
+      let verifiedPage
+      let verifiedEngine
+      /* Decides what the response header may claim below: a bare search result
+         is not evidence that the picture shows the subject. */
+      let verified = false
+      try {
+        const cached = cachedUrl(width, query, planEngine, subject)
+        if (cached !== undefined) {
+          url = cached.url
+          verified = true
+          verifiedTitle = cached.title
+          verifiedPage = typeof cached.page === 'string' ? cached.page : undefined
+          verifiedEngine = cached.engine ?? planEngine
+        } else {
+          const extra = {
+            subject,
+            ...(fit === 'square' && size !== undefined ? { minPixels: size } : {}),
+          }
+          const candidate = await resolveVerified(query, width, planEngine, plan.sources, extra)
+          verified = candidate !== undefined
+          if (verified) {
+            url = candidate.url
+            verifiedTitle = candidate.title
+            if (typeof candidate.page === 'string' && candidate.page !== '') verifiedPage = candidate.page
+            if (typeof candidate.engine === 'string') verifiedEngine = candidate.engine
+          }
+        }
+      } catch (error) {
+        failures.push(`search(${plan.engine ?? 'default'}): ${String(error).slice(0, 90)}`)
+        continue
+      }
+      if (url === undefined) continue
+      try {
+        bytes = await fetchCandidate(url)
+      } catch (error) {
+        /* The URL is poisoned for this source: drop it so the next hit re-searches. */
+        forgetUrl(width, query, planEngine, subject)
+        failures.push(`${plan.engine ?? 'default'}: ${String(error).slice(0, 90)}`)
+        continue
+      }
+      if (fit === 'square' && size !== undefined) {
+        const cropped = await squareCrop(bytes, size)
+        if (cropped !== undefined) bytes = cropped
+      }
+      /* Bytes actually served by a verified candidate: only then is the title true. */
+      matchTitle = verified ? verifiedTitle : undefined
+      if (verified) {
+        const entry = {
+          url,
+          title: verifiedTitle,
+          page: verifiedPage,
+          engine: verifiedEngine ?? planEngine ?? engine ?? null,
+          verified: true,
+          at: Date.now(),
+        }
+        urlCache.set(cacheKey(width, query, planEngine, subject), entry)
+        if (matchTitle !== undefined) {
+          sourceCache.set(sourceKey(width, query, subject), {
+            query,
+            subject,
+            title: matchTitle,
+            page: verifiedPage,
+            engine: entry.engine,
+            at: Date.now(),
+          })
+        }
+      }
+      rememberBytes(byteKey, bytes)
+      break
+    }
+
+    /* Last-resort page binding after fast, subject-verified candidates fail.
+       Prefetched images can now be served without a slow page search. */
+    if (bytes === undefined) {
+      try {
+        const bound = await resolveBound(query, subject)
+        if (bound !== undefined && typeof bound.url === 'string') {
+          const boundBytes = await fetchFitted(bound.url, fit, size)
+          if (boundBytes !== undefined) {
+            bytes = boundBytes
+            matchTitle = bound.title
+            if (typeof bound.page === 'string' && /^https?:\/\//i.test(bound.page)) boundPage = bound.page
+            if (bound.title !== undefined) {
+              sourceCache.set(sourceKey(width, query, subject), {
+                query, subject, title: bound.title, page: bound.page,
+                engine: bound.engine, at: Date.now(),
+              })
+            }
+            rememberBytes(byteKey, bytes)
+          }
+        }
+      } catch (error) {
+        failures.push('page: ' + String(error).slice(0, 90))
+      }
+    }
+  }
+
+  if (bytes === undefined) {
+    /* Nothing checked out. Answer 404 so the <img> fires `error` and the card
+       renderer drops the tile: a "no verified picture" card is still a card the
+       reader has to look at, and it reads as a broken slot. A random search hit
+       is not the alternative either — that is how the wrong picture got in.
+       Verified or nothing means nothing here, not a placeholder. */
+    res.writeHead(404, {
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-async-ui': 'unverified',
+      'x-async-ui-placeholder': '1',
+    })
+    if (req.method === 'HEAD') res.end()
+    else res.end('no verified picture for q=' + query + ' subject=' + subject)
+    return
+  }
+
+  res.writeHead(200, {
+    'content-type': bytes.type,
+    'content-length': String(bytes.buf.length),
+    /* Never let the browser pin an image: the same URL can resolve differently
+       after a resolver/plan change, and a pinned copy looks like a wrong picture. */
+    'cache-control': 'no-store',
+    'x-async-ui': fromCache ? 'warm' : failures.length > 0 ? 'source-fallback' : 'resolved',
+    ...(fit === 'square' ? { 'x-async-ui-fit': `square${size}` } : {}),
+    ...(matchTitle === undefined ? { 'x-async-ui-match': 'unverified' } : { 'x-async-ui-match': encodeURIComponent(matchTitle.slice(0, 120)) }),
+    ...(boundPage === undefined ? {} : { 'x-async-ui-page': encodeURIComponent(boundPage.slice(0, 200)) }),
+  })
+  if (req.method === 'HEAD') {
+    res.end()
+    return
+  }
+  res.end(bytes.buf)
+}
+
+/**
+ * Report where one resolved picture came from.
+ *
+ * The client decorates every `/async-img` picture with a small source line, so
+ * a wrong picture is visibly tied to a wrong page instead of being an
+ * unverifiable claim. Answers `{}` when the picture was never verified.
+ */
+function serveMeta(req, res) {
+  const parsed = new URL(req.url ?? '/', 'http://localhost')
+  const query = (parsed.searchParams.get('q') ?? '').trim().slice(0, MAX_QUERY)
+  const subject = (parsed.searchParams.get('s') ?? parsed.searchParams.get('subject') ?? query).trim().slice(0, MAX_SUBJECT)
+  const width = clampWidth(parsed.searchParams.get('w'))
+  const hit = query === '' ? undefined : sourceCache.get(sourceKey(width, query, subject))
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  })
+  /* Baidu reports its source pages as obfuscated paths, not URLs: a href built
+     from one would be a lie, so only a real URL becomes a link. */
+  const page = typeof hit?.page === 'string' && /^https?:\/\//i.test(hit.page) ? hit.page : null
+  res.end(JSON.stringify(hit === undefined ? {} : {
+    query: hit.query,
+    title: hit.title,
+    page,
+    engine: hit.engine ?? null,
+  }))
+}
+
+/**
+ * Read the `spec` argument defensively.
+ *
+ * The tool-call bridge has been observed delivering `{ spec: <object> }`,
+ * `{ spec: "<JSON>" }`, `{ arguments: … }` and bare strings; the authored
+ * shape is unwrapped here so the rewrite always sees the real tree.
+ */
+function specOf(args) {
+  if (typeof args === 'string') {
+    try {
+      return JSON.parse(args)
+    } catch {
+      return undefined
+    }
+  }
+  if (args === null || typeof args !== 'object') return undefined
+  const record = args
+  let value = 'spec' in record ? record.spec : 'arguments' in record ? record.arguments : record
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof value === 'string') {
+      try {
+        value = JSON.parse(value)
+      } catch {
+        return undefined
+      }
+    }
+    if (value !== null && typeof value === 'object' && 'spec' in value) {
+      value = value.spec
+      continue
+    }
+    break
+  }
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : undefined
+}
+
+/** Card title shared by the pending and settled presentations. */
+function titleOf(args) {
+  const spec = specOf(args)
+  const title = spec === null || spec === undefined ? undefined : pickString(spec.title)
+  return title ?? '未命名'
+}
+
+/** Arguments: one open `spec` slot (the guard, not the schema, is authority). */
+const PARAMETERS = {
+  type: 'object',
+  properties: {
+    spec: {
+      type: 'object',
+      description: [
+        'GenUI spec to render as a card in the tool row. Same white-listed vocabulary as the dsh-ui fence.',
+        'ASYNC IMAGES: instead of a real URL, an image node may carry `query` (a natural-language description such as "赛博朋克夜景 城市 霓虹").',
+        'The host resolves every query into a real image and rewrites the node before rendering — one call, no manual image search.',
+        'Nodes that already carry `src` are left untouched, so local screenshots (/api/file?path=…) and known URLs keep working.',
+        'Applies to `image`, `image-group` items, and `compare` before/after (any `{src}` record with a query field).',
+      ].join(' '),
+      properties: {
+        title: { type: 'string', description: 'Short title shown as the card banner.' },
+        gap: { type: 'number', description: 'Vertical gap between root items in px.' },
+        items: {
+          type: 'array',
+          description: 'Root component list (white-listed GenUI vocabulary).',
+          items: { type: 'object' },
+        },
+      },
+    },
+  },
+  required: ['spec'],
+  additionalProperties: false,
+}
+
+/**
+ * Tool definition kept for reference: `render_ui` is NOT registered any more.
+ * The fence path is the only one — a tool result lands in the collapsed tool
+ * row (“面板”), which is exactly what the user rejected.
+ */
+function createAsyncRenderTool(config = {}) {
+  const options = {
+    maxImages: config.maxImages,
+    width: config.width,
+    engine: typeof config.engine === 'string' ? config.engine : undefined,
+  }
+
+  return {
+    name: 'render_ui',
+    description:
+      'Render an interactive UI card in the conversation tool row. Same GenUI vocabulary as the dsh-ui fence, plus ASYNC IMAGES: '
+      + 'give an image node `query` (a description) instead of `src` and the host resolves it to a real picture — use this for '
+      + '“illustrate this with a photo of X”, covers, mood boards and galleries where you do not have a URL. '
+      + 'Existing src values (https URLs, /api/file?path=… local screenshots) are never touched. '
+      + 'The card is interactive client-side; components carrying an "action" field send [genui-action] back to you, and you should re-render.',
+    parameters: PARAMETERS,
+    output: {
+      schema: { type: 'string', description: 'One-line render summary for the model.' },
+      render(_args, value) {
+        return [{ type: 'text', text: String(value) }]
+      },
+      presentationMeta(args) {
+        const spec = specOf(args)
+        if (spec === undefined) return null
+        const { spec: resolved } = resolveSpec(spec, options)
+        return resolved
+      },
+    },
+    async execute(args) {
+      const spec = specOf(args)
+      if (spec === undefined) {
+        return ['[async-ui]', 'status=invalid', 'error=spec_not_an_object', 'next=fix_and_retry', 'reply_language=conversation'].join('\n')
+      }
+      if (!Array.isArray(spec.items)) {
+        return ['[async-ui]', 'status=invalid', 'error=items_required', 'next=fix_and_retry', 'reply_language=conversation'].join('\n')
+      }
+      const { stats } = resolveSpec(spec, options)
+      const pre = stats.queries.length > 0
+        ? await prefetch(stats.queries, options)
+        : { warm: 0, total: 0 }
+      return [
+        '[async-ui]',
+        'status=rendered',
+        `images=${stats.resolved}`,
+        ...(pre.total > 0 ? [`prefetch=${pre.warm}/${pre.total}`] : []),
+        ...(stats.skipped > 0 ? [`skipped=${stats.skipped}`, `max_images=${options.maxImages ?? DEFAULT_MAX_IMAGES}`] : []),
+        `resolve_route=${routeReady ? ROUTE : FALLBACK_ROUTE}`,
+        'reply_language=conversation',
+      ].join('\n')
+    },
+    presentCall(args) {
+      return { card: 'generic', title: `渲染 UI：${titleOf(args)}`, kind: 'other' }
+    },
+    presentResult(args) {
+      return { card: 'generic', title: `渲染 UI：${titleOf(args)}` }
+    },
+  }
+}
+
+/**
+ * Register the async `render_ui` tool and the late-resolving image route.
+ *
+ * @param ctx - Cordis context.
+ * @param config - `maxImages`, `width`, `engine` (see README).
+ */
+export function apply(ctx, config) {
+  const settings = config ?? {}
+
+  /* Without this a fresh session has no idea the route exists and falls back
+     to downloading files with image_hunt. */
+  ctx.systemPrompt.section({
+    name: 'async-ui:images',
+    // Place image-specific rules after both GenUI and the user-personalization section (order 4000).
+    order: Math.max(ctx.systemPrompt.getSectionOrder('STRUCTURED_OUTPUT') + 1, 5000),
+    text: SECTION_TEXT,
+  })
+
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = typeof webCtx.reflect?.get === 'function'
+      ? webCtx.reflect.get('webServer')
+      : webCtx.webServer
+    if (webServer === undefined || typeof webServer.register !== 'function') return
+    try {
+      /* Old messages in the conversation still point at the first route name;
+         keep it alive so历史里的图 don't turn into broken images. */
+      for (const legacy of ['/async-ui-img']) {
+        webCtx.effect(
+          () => webServer.register({
+            kind: 'prefix',
+            path: legacy,
+            handler: (req, res) => { res.writeHead(302, { location: `/async-img${(req.url ?? '').slice(req.url.indexOf('?') === -1 ? req.url.length : req.url.indexOf('?'))}` }); res.end() },
+          }, 'dsh-async-ui: legacy route'),
+        )
+      }
+      webCtx.effect(
+        () => webServer.register({
+          kind: 'prefix',
+          path: STYLE_ROUTE,
+          handler: (req, res) => {
+            readFile(STYLE_FILE).then((buffer) => {
+              res.writeHead(200, {
+                'content-type': 'application/json; charset=utf-8',
+                'cache-control': 'public, max-age=3600',
+                'x-async-ui-style': 'openfreemap-liberty',
+              })
+              res.end(buffer)
+            }).catch((error) => {
+              try {
+                res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+                res.end(String((error && error.message) || error))
+              } catch {}
+            })
+          },
+        }),
+        'dsh-async-ui: map style route',
+      )
+      webCtx.effect(
+        () => webServer.register({
+          kind: 'prefix',
+          path: META_ROUTE,
+          handler: (req, res) => {
+            try {
+              serveMeta(req, res)
+            } catch (error) {
+              try { res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' }); res.end(String(error)) } catch {}
+            }
+          },
+        }),
+        'dsh-async-ui: image source route',
+      )
+      webCtx.effect(
+        () => webServer.register({
+          kind: 'prefix',
+          path: ROUTE,
+          handler: (req, res) => {
+            Promise.resolve()
+              .then(() => serveAsyncImage(req, res))
+              .catch((error) => {
+                try {
+                  res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+                  res.end(String((error && error.stack) || error))
+                } catch {}
+              })
+          },
+        }),
+        'dsh-async-ui: async image route',
+      )
+      routeReady = true
+    } catch {
+      routeReady = false
+    }
+  })
+
+}

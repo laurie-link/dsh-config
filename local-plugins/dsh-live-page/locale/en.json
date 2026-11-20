@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Live page editor",
+    "description": "Edit rendered workspace HTML pages in the IDE browser and give the agent the current page and selected text."
+  }
+}

@@ -1,0 +1,8 @@
+# dsh-session-search bundle patch: mount the plugin row.
+#
+# The row name is both the Host half's Node import specifier (resolved from the
+# profile's node_modules) and the key dsh-client-modules uses to load the
+# browser half (package exports["./client"]), so one row mounts both halves.
+- insert:
+    - id: session-search
+      name: 'dsh-session-search'

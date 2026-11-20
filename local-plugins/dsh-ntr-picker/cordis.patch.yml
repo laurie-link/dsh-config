@@ -1,0 +1,175 @@
+# Mount line for the dsh-ntr bundle.
+#
+# The pure package-name row is REQUIRED for the ClientModuleRegistry to match
+# the browser half (dsh.client in package.json); the host half is the same row
+# (one plugin module carries both Node and browser entries).
+#
+# `agents` below SEEDS the agent registry at boot (BridgeManager's constructor
+# `defs`), but it is not the only source and not a boundary. The settings page's
+# launch-command box (`AgentForm.commandLine` in src/client/panel.tsx) writes
+# through RPC `agent/save` → `validateAgentDef` → `BridgeManager.saveAgent` into
+# `~/.dsh/dsh-ntr/agents.json`, and that is what spawns the child.
+# `validateAgentDef` checks shape only (non-empty, splittable command line,
+# length) — there is no program whitelist, so the browser CAN name any program.
+# A child's env comes from the same two places, and `detectHostAgents` hands the
+# stored `command` / `args` / `env` back to the browser UNSANITIZED as
+# `currentConfig`, where `envRows` edits them.
+- insert:
+    - id: dsh-ntr
+      name: dsh-ntr
+      config:
+        agents: []
+        # PICKER FORK: global auto-approval. An ACP permission ask is settled the
+        # moment it arrives, picking the agent's broadest allow option
+        # (allow_always > allow_once), so no card is ever shown. Remove or set
+        # `permissionTimeoutMode: wait` to get the approval cards back.
+        permissionTimeoutMs: 0
+        permissionTimeoutMode: auto
+        # transcriptMaxEntries: 600
+        # probeModelsOnBoot: true   # DEAD — validated and stored, never read.
+        #                                `bootstrapCatalogs` is empty, so boot
+        #                                probes nothing whatever this says; true
+        #                                and false behave identically. Real
+        #                                probes: RPC `agent/probe-models` (the
+        #                                settings button) and `probeAgentModels`
+        #                                after `saveAgent`.
+        # Reliability tuning (defaults shown):
+        # startupTimeoutMs: 60000    # budget for initialize / session/new / session/load
+        # permissionTimeoutMs: 300000
+        #                              How long a permission ask may sit unanswered
+        #                              before the deadline fires. ONE window for every
+        #                              ask, wherever it is answered — the conversation
+        #                              card above the composer (`PermissionDock`) or
+        #                              the Settings page's cross-session mirror
+        #                              ("待处理权限请求"): one question, one answer.
+        #                              0 = 不等待: the ask is settled the moment it
+        #                              arrives, nobody is asked (no conversation card,
+        #                              no pending entry on the Settings page). That
+        #                              rung belongs to the `auto` mode ONLY — it
+        #                              ANSWERS the ask, so the agent continues. Under
+        #                              `abort` the same zero would refuse every ask on
+        #                              arrival (the agent stops at every gate), so
+        #                              `abort` starts at the shortest real wait. "Never
+        #                              expires" is NOT this key's business — that is
+        #                              `wait` mode below.
+        #                              When the deadline fires, the ask is settled IN
+        #                              PLACE: the card goes away and `permission/expired`
+        #                              records the outcome in the conversation. What
+        #                              happens is `permissionTimeoutMode`'s business.
+        #                              LEGACY: `nativeApprovalTimeoutMs` and
+        #                              `permissionFallbackTimeoutMs` are still accepted
+        #                              and folded into this key (this key wins when it
+        #                              is present), so an older config keeps meaning
+        #                              what it meant. A LEGACY 0 meant "never
+        #                              expires", so it migrates to `wait` mode with
+        #                              the default window — never to 不等待, which
+        #                              would silently turn "wait forever" into
+        #                              "answer at once".
+        # permissionTimeoutMode: wait
+        #                              What an EXPIRED deadline does — three values, no
+        #                              more:
+        #                                wait   never expire; the ask stays pending,
+        #                                       visibly, until a human answers it or the
+        #                                       session is cancelled. DEFAULT: a
+        #                                       permission ask is a question FOR A HUMAN,
+        #                                       so the safe default is to keep waiting
+        #                                       rather than to refuse (or worse, approve)
+        #                                       on their behalf.
+        #                                abort  refuse the ask (`cancelled`); the agent
+        #                                       continues with that answer.
+        #                                auto   answer it with the option the AGENT's own
+        #                                       kinds imply (allow_always → allow_once →
+        #                                       reject_once → reject_always → the first
+        #                                       option) and let the agent CONTINUE.
+        #                                       Unattended operation: this may approve
+        #                                       something nobody looked at, which is why
+        #                                       it is opt-in and why the outcome is
+        #                                       announced. Same rule as OmniTerm dev's
+        #                                       `pick_auto_option`.
+        #                              The window and the mode are BOTH editable at
+        #                              runtime (NTR 设置 → 审批时限). The card's values
+        #                              are persisted in the plugin's own state file and
+        #                              OUTRANK this file; the card shows what this file
+        #                              asked for and offers a reset back to it.
+        # cancelFallbackMs: 15000    # force-finalize a turn the agent ignores after session/cancel (0 = off)
+        # staleCancelRetryDelayMs: 600  # resend a prompt answered cancelled with no cancel requested (0 = at once)
+        # staleCancelMaxRetries: 2      # cap on those resends before the cancelled stop is reported as-is
+        # turnStallMs: 600000        # inactivity watchdog: finalize a turn the agent
+        #                              went silent in for this long (0 = disable the
+        #                              WHOLE watchdog, tool window included). It
+        #                              finalizes the TURN only — the process is NOT
+        #                              killed; the next message reclaims the session
+        #                              (releaseAll + session/load, or a reset when
+        #                              the agent cannot load).
+        # turnStallToolMs: 1800000   # the same window while ANY ACP tool call is
+        #                              still active by id (parallel calls count as a
+        #                              set); 0 = fall back to turnStallMs
+        # turnStallTickMs: 30000     # how often the watchdog scans; tuning / tests
+        #                              only, there is no settings-page control
+        # idleTimeoutMs: 1800000     # how long a chat process may sit idle before
+        #                              it is released (parked, then resumed by the
+        #                              next message). 0 = never release. The
+        #                              DEPLOYMENT baseline: the settings page's
+        #                              「进程管理」 tab (NTR 设置 → 进程管理) edits
+        #                              this window on a 1-60 minute slider and
+        #                              persists its pick in the plugin's own state
+        #                              file, which OUTRANKS the value here; the card
+        #                              shows what this file asks for and offers a
+        #                              reset back to it. A per-agent
+        #                              `agents[].idleTimeoutMs` still wins over both —
+        #                              that promise is about the agent. The PROBE
+        #                              window is a separate thing and stays fixed at 5
+        #                              minutes: a process that never hosted a session
+        #                              has no stake in a chat window.
+        # ACP 模式 (agent preset) is declared by this package's own bundle
+        # patch list (package.json `dsh.bundle.patch` → presets/acp/acp.patch.yml),
+        # so it needs no install step and has no config knob. The settings card
+        # only reports the harness roster's verdict for the `preset-acp` row.
+        # The plugin's OWN default ACP agent (panel's ★ button) lives in the
+        # agent registry file at `~/.dsh/dsh-ntr/agents.json`, key
+        # `defaultAgentId` (`pluginStateDir` + `BridgeManager.getStoragePath`).
+        # `~/.dsh/acp-agents.json` is only a MIGRATION SOURCE (`legacyStatePaths`):
+        # `migrateLegacyState` moves it into the plugin directory on first boot,
+        # and nothing writes the old path afterwards.
+        # This plugin never reads or writes DSH's deployment default model: no
+        # ACP route is ever written there, so there is nothing to guard. (An
+        # older revision did write one and needed a host-side guard to put a
+        # native route back — both are gone; see AGENTS.md constraint 22.)
+        # Per-agent ACP-model filter — which of the agent's models its own
+        # conversation seats offer (panel checkboxes persist here). ACP models
+        # are never advertised in DSH's model catalog, so they cannot leak into
+        # a non-ACP conversation:
+        # agents:
+        #   - id: pi
+        #     command: pi-acp
+        #     npmPackage: pi-acp        # auto `npm install -g` when command is missing from PATH
+        #     exposedModels: [model-a, model-b]   # opt-in `agent@choice` variants; unset/[] = base entry only
+        #     idleTimeoutMs: 1800000     # release a chat process once it has been idle
+        #                                #   this long (ms) with NO live session
+        #                                #   (0 = never; unset = follow the plugin-level
+        #                                #   `idleTimeoutMs` above). This window
+        #                                #   applies ONLY to a process that has hosted a
+        #                                #   session: a probe child (`everHostedSession`
+        #                                #   false — what a model probe or a post-save
+        #                                #   probe leaves behind, i.e. the row the panel
+        #                                #   shows as connected) is released after
+        #                                #   `probeIdleTimeoutMs` (5 min) whatever this
+        #                                #   says, 0 included.
+        #     mcpServers:                # extra MCP servers handed to the agent at
+        #       - name: codegraph        #   session setup (the agent starts them
+        #         transport: stdio       #   itself). The plugin's OWN shape: every
+        #         command: /opt/bin/codegraph   #   entry carries a name and a transport.
+        #         args: [serve, --mcp]    #   `stdio` needs command, `http`/`sse` need
+        #         env: { KEY: value }    #   url. NOT the ACP wire shape, whose stdio
+        #                                #   variant has no `type` field (an entry
+        #                                #   written that way is silently dropped by
+        #                                #   the agent).
+
+# PICKER FORK: also mount the ACP display-card guard globally for ordinary
+# sessions. `pickerOnly: true` limits every duty to sessions the host actually
+# bound to an ACP agent, so plain harness conversations are untouched.
+- insert:
+    - id: acp-guard-global
+      name: 'dsh-ntr/acp-guard'
+      config:
+        pickerOnly: true

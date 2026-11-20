@@ -1,0 +1,387 @@
+/**
+ * dsh-personalization — Host half.
+ *
+ * ChatGPT「个性化」的 DSH 版本：六个下拉（基础风格和语气 / 亲切程度 / 热情程度 /
+ * 表情符号 / 可视化回答 / 标题和列表）保存成一份 JSON，再在每一步把非默认项
+ * 渲染成一段系统提示词段落。
+ *
+ * 为什么不走插件 Config：Config 的即时表单藏在「设置 → 插件 → 本插件」里，
+ * 且改一次要走 ConfigEditor 的 volatile 通道；这里用一条自己的同源路由读写
+ * ~/.dsh/personalization.json，浏览器那半（client.js）因此可以画出和 ChatGPT
+ * 一样的分区页面，保存后下一轮对话立即生效，不需要重启 Host。
+ */
+
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
+export const name = 'dsh-personalization'
+export const inject = ['systemPrompt', 'webServer']
+
+/** Same-origin route prefix for the browser half. */
+const ROUTE = '/dsh-personalization'
+/** One JSON document holds every dimension. */
+const CONFIG_PATH = path.join(os.homedir(), '.dsh', 'personalization.json')
+/** Largest accepted request body. */
+const MAX_BODY_BYTES = 8 * 1024
+
+/** Dimension order is also the order used on the settings page. */
+const KEYS = ['tone', 'detail', 'jargon', 'friendliness', 'enthusiasm', 'emoji', 'visual', 'media', 'headings']
+
+/**
+ * Every dimension is an enum of `[value, label]`. `default` means "no rule":
+ * the model keeps its own judgement, exactly like ChatGPT's 默认.
+ */
+const OPTIONS = {
+  tone: [
+    ['default', '默认'],
+    ['professional', '专业严谨'],
+    ['natural', '轻松自然'],
+    ['direct', '直接简洁'],
+    ['warm', '温暖耐心'],
+  ],
+  detail: [
+    ['default', '默认'],
+    ['plain', '只说结果'],
+    ['why', '结果+原因'],
+    ['technical', '技术细节'],
+  ],
+  jargon: [
+    ['default', '默认'],
+    ['plain', '说人话'],
+    ['balanced', '术语配白话'],
+    ['technical', '专业术语'],
+  ],
+  friendliness: [
+    ['default', '默认'],
+    ['reserved', '更克制'],
+    ['friendly', '更亲切'],
+    ['close', '很亲切'],
+  ],
+  enthusiasm: [
+    ['default', '默认'],
+    ['calm', '更冷静'],
+    ['upbeat', '更热情'],
+    ['lively', '非常热情'],
+  ],
+  emoji: [
+    ['default', '默认'],
+    ['less', '少用'],
+    ['none', '不用'],
+    ['more', '多用'],
+  ],
+  visual: [
+    ['default', '默认'],
+    ['less', '更少'],
+    ['more', '更多'],
+  ],
+  media: [
+    ['default', '默认'],
+    ['none', '不配图'],
+    ['some', '关键处配图'],
+    ['rich', '多配图'],
+  ],
+  headings: [
+    ['default', '默认'],
+    ['less', '减弱'],
+    ['more', '增强'],
+  ],
+}
+
+const DEFAULTS = Object.fromEntries(KEYS.map((key) => [key, 'default']))
+
+/** One rule line per non-default dimension. */
+const RULES = {
+  tone: {
+    professional: '语气：专业、克制，像资深工程师写文档。不用感叹号，不寒暄，不下结论以外的形容词。',
+    natural: '语气：像同事当面聊天，短句、口语都行，但别油腻，别用网络热梗堆气氛。',
+    direct: '语气：先给结论。一句话说得完就不写两句，删掉铺垫、过程复述和结尾总结。',
+    warm: '语气：先接住对方的处境，再给方案。可以承认这件事确实麻烦，但不煽情。',
+  },
+  detail: {
+    plain: '细节层级：只用大白话讲结果和影响。不要出现文件名、路径、函数名、配置键、字段名、命令行和代码片段；不要解释改的是哪一层，直接说现在会怎样。',
+    why: '细节层级：先用大白话讲结果和影响，再补一句说清原因。默认不报文件名、代码、字段名和命令，除非用户追问具体是哪里、或者要排查问题；那时再给精确位置。',
+    technical: '细节层级：可以给出文件名、路径、函数名、字段名和命令原文，方便用户自己复查；但每处细节前面先用一句白话说明它解决什么问题、影响什么。',
+  },
+  jargon: {
+    plain: '用词：说人话。能用日常词表达就别用行业术语；非留不可的技术名词，第一次出现时用一句白话解释它是什么、解决什么问题。',
+    balanced: '用词：术语该用就用，但每个关键术语后面补一句白话；别为了显得专业而堆名词。',
+    technical: '用词：按领域惯用的专业写法，假设读者懂行；术语优先于口语描述，但不为堆砌而堆砌。',
+  },
+  friendliness: {
+    reserved: '亲密度：保持礼貌距离。别用「我们」「兄弟」「宝子」这类称呼，不用「顺便说一句」式的套近乎。',
+    friendly: '亲密度：放松一点。可以直接用「你」，可以有一句简短的个人判断，但不刻意讨好。',
+    close: '亲密度：像熟人说话。允许一句调侃或共情，但不越界、不装作有私人关系。',
+  },
+  enthusiasm: {
+    calm: '热情度：情绪平稳。不渲染进展，不用「太棒了」「完美」这类评价词。',
+    upbeat: '热情度：积极一点。做成了什么直接说，喜悦靠事实传递，不靠感叹号。',
+    lively: '热情度：明显雀跃，但每个感叹都要有具体事实支撑；没有事实就收住。',
+  },
+  emoji: {
+    less: '表情符号：克制。整条回答最多一个 emoji，能不写就不写。',
+    none: '表情符号：不要使用 emoji 或颜文字。',
+    more: '表情符号：每条回答可用 1–3 个 emoji，放在句末或列表项末尾，不要塞进标题和代码。',
+  },
+  visual: {
+    less: '可视化回答：只在真的能省字时用表格、图表或 dsh-ui 围栏；一句话能说清就写纯文字，不要为了好看加组件。',
+    more: '可视化回答：遇到对比、数值、步骤、清单、多个并列选项，用表格、步骤条或 dsh-ui 围栏；出现具体的东西就用图片；没有能拍的东西（配置、流程、结构、代码逻辑）就用 diagram / mermaid / svg 画结构图或流程图。视觉元素数量按内容需要决定；图片数量遵循独立的丰富配图规则，不受“通常两到四个视觉元素”的限制。一句话能说清的地方别套壳，组件里也不要复述正文说过的话。',
+  },
+  media: {
+    none: '配图：除非我明确要求，不要在回答里插图。',
+    some: '配图：回答里只要出现能拍下来的具体东西（地点、菜、物件、作品、角色、产品、场所），就顺手配一张，不要问我要不要。单图写在 dsh-ui 的 image-group 里，src 用 /async-img?q=<检索词>&w=900；检索词用该事物的原本语言（外国作品、角色、品牌、地名写原名）。取图过程不要写进正文。',
+    rich: '配图：采用丰富配图，不设每条回答 1–4 张或 2–5 张的硬上限。先识别正文中的核心视觉实体、主要章节和需要单独辨认的形态/场景。短回答通常 1–3 张；常规解释、比较或攻略通常 3–6 张；长篇研究、教程或多章节回答通常 6–12 张，内容需要时可以更多。每个被认真比较、推荐或排名的对象至少配 1 张；同一对象存在不同形态、关键细节、使用场景或前后状态，且这些差异有助于理解时，再补 1–2 张不同图片。多张图片用 image-group（每组最多 24 张），同一主题/章节一组；不同章节分别成组并紧邻对应文字。不要把所有图片堆在开头或结尾，不要用一张拼图或代表图代替多个对象。重复提及同一对象不重复配图；不同形态/型号必须分别配图。图片数量由内容决定，不受固定上限限制。没有可核对视觉对象的纯代码、报错、纯数据或抽象概念不硬配图。没有实拍对象时，流程/架构用 diagram / mermaid / svg 画示意图。',
+  },
+  headings: {
+    less: '标题和列表：少用 Markdown 标题和列表。用连贯段落讲清楚，列表只留给真正并列、需要逐条对照的项。',
+    more: '标题和列表：用短标题分段（不超过三级），并列信息用列表归纳，方便扫读；不要给每句话都加标题。',
+  },
+}
+
+const SECTION_PREFIX = '## 回答风格（用户个性化设置，优先于默认写作习惯）'
+
+/**
+ * 独立的指令文档目录：每个 *.md 都作为一个系统提示词段落注入，和 AGENTS.md
+ * 同等地位（区别只是这里的文件由本插件读，不占用 AGENTS.md 的篇幅）。
+ * personality.md 里的托管块由设置页生成，标记之外的内容用户可以自由编辑。
+ */
+const INSTRUCTION_DIR = path.join(os.homedir(), '.dsh', 'instructions')
+const PERSONALITY_FILE = path.join(INSTRUCTION_DIR, 'personality.md')
+const MANAGED_BEGIN = '<!-- dsh-personalization:begin -->'
+const MANAGED_END = '<!-- dsh-personalization:end -->'
+
+/** Directory snapshot, keyed by the mtimes of the directory and its files. */
+let filesCache = { key: null, files: [] }
+
+function readInstructionFiles() {
+  try {
+    const stat = fs.statSync(INSTRUCTION_DIR)
+    const entries = fs.readdirSync(INSTRUCTION_DIR).filter((entry) => entry.endsWith('.md')).sort()
+    const stamps = entries.map((entry) => {
+      try {
+        return `${entry}:${fs.statSync(path.join(INSTRUCTION_DIR, entry)).mtimeMs}`
+      } catch {
+        return entry
+      }
+    })
+    const key = `${stat.mtimeMs}|${stamps.join(',')}`
+    if (filesCache.key === key) return filesCache.files
+    const files = entries.map((entry) => ({
+      name: entry,
+      text: fs.readFileSync(path.join(INSTRUCTION_DIR, entry), 'utf8'),
+    }))
+    filesCache = { key, files }
+    return files
+  } catch {
+    filesCache = { key: null, files: [] }
+    return filesCache.files
+  }
+}
+
+/** Split a personality.md into its generated block and the hand-written tail. */
+function splitManaged(text) {
+  const begin = text.indexOf(MANAGED_BEGIN)
+  const end = text.indexOf(MANAGED_END)
+  if (begin === -1 || end === -1 || end < begin) return { managed: null, free: text.trim() }
+  return {
+    managed: text.slice(begin + MANAGED_BEGIN.length, end).trim(),
+    free: text.slice(end + MANAGED_END.length).trim(),
+  }
+}
+
+
+/** Cached parsed document and the mtime it came from. */
+let cache = null
+let cacheMtime = -1
+
+function sanitize(raw) {
+  const next = { ...DEFAULTS }
+  if (raw === null || typeof raw !== 'object') return next
+  for (const key of KEYS) {
+    const value = raw[key]
+    if (typeof value === 'string' && OPTIONS[key].some(([candidate]) => candidate === value)) next[key] = value
+  }
+  return next
+}
+
+function readState() {
+  try {
+    const stat = fs.statSync(CONFIG_PATH)
+    if (cache !== null && stat.mtimeMs === cacheMtime) return cache
+    cache = sanitize(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')))
+    cacheMtime = stat.mtimeMs
+    return cache
+  } catch {
+    if (cache === null) cache = { ...DEFAULTS }
+    return cache
+  }
+}
+
+function writeState(next) {
+  fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true })
+  fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(next, null, 2)}\n`, 'utf8')
+  cache = next
+  try {
+    cacheMtime = fs.statSync(CONFIG_PATH).mtimeMs
+  } catch {
+    cacheMtime = -1
+  }
+}
+
+/** Render the system-prompt section; empty when every dimension is 默认. */
+export function renderSection(state) {
+  const lines = []
+  for (const key of KEYS) {
+    const value = state[key] ?? 'default'
+    if (value === 'default') continue
+    const rule = RULES[key]?.[value]
+    if (rule !== undefined) lines.push(`- ${rule}`)
+  }
+  if (lines.length === 0) return ''
+  return `${SECTION_PREFIX}\n${lines.join('\n')}\n以上风格只改表达方式，不改事实、不改安全边界、不改工具用法。`
+}
+
+
+/**
+ * Everything this plugin injects: the generated style block plus every extra
+ * *.md in ~/.dsh/instructions/ (personality.md first, then files by name).
+ */
+export function renderContext(state) {
+  const parts = []
+  let sawPersonality = false
+  const discovered = readInstructionFiles()
+  // personality.md carries the style block and always leads the section.
+  const ordered = discovered
+    .filter((file) => file.name === 'personality.md')
+    .concat(discovered.filter((file) => file.name !== 'personality.md'))
+  for (const file of ordered) {
+    const body = file.text.trim()
+    if (file.name === 'personality.md') {
+      sawPersonality = true
+      const { managed, free } = splitManaged(file.text)
+      const pieces = []
+      if (managed !== null && managed !== '') pieces.push(managed)
+      if (free !== '') pieces.push(free)
+      if (pieces.length > 0) parts.push(pieces.join('\n\n'))
+      continue
+    }
+    if (body === '') continue
+    const heading = body.startsWith('#') ? '' : `## ${file.name.replace(/^\d+[-_]?/, '').replace(/\.md$/, '')}\n\n`
+    parts.push(`${heading}${body}`)
+  }
+  if (!sawPersonality) {
+    const generated = renderSection(state)
+    if (generated !== '') parts.push(generated)
+  }
+  return parts.join('\n\n')
+}
+
+/** Regenerate the managed block of personality.md, preserving the hand-written tail. */
+export function writePersonality(state) {
+  const generated = renderSection(state)
+  const block = generated === '' ? '' : `${MANAGED_BEGIN}\n${generated}\n${MANAGED_END}`
+  let free = ''
+  try {
+    free = splitManaged(fs.readFileSync(PERSONALITY_FILE, 'utf8')).free
+  } catch {
+    free = ''
+  }
+  const body = [block, free].filter((part) => part !== '').join('\n\n')
+  fs.mkdirSync(INSTRUCTION_DIR, { recursive: true })
+  fs.writeFileSync(PERSONALITY_FILE, `${body.trim()}\n`, 'utf8')
+  filesCache = { key: null, files: [] }
+}
+
+function sendJson(res, status, body) {
+  res.statusCode = status
+  res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.setHeader('cache-control', 'no-store')
+  res.end(JSON.stringify(body))
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let bytes = 0
+    req.on('data', (chunk) => {
+      bytes += chunk.length
+      if (bytes > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+function configHandler(_req, res) {
+  const values = readState()
+  sendJson(res, 200, {
+    values,
+    options: OPTIONS,
+    order: KEYS,
+    path: CONFIG_PATH,
+    // The settings page renders each option's rule text verbatim, so it needs
+    // the same table the prompt renderer uses.
+    rules: RULES,
+    // Combined text of everything injected this turn: the generated block plus
+    // every extra markdown document in the instruction directory.
+    preview: renderContext(values),
+    dir: INSTRUCTION_DIR,
+    files: readInstructionFiles().map((file) => ({
+      name: file.name,
+      bytes: Buffer.byteLength(file.text, 'utf8'),
+    })),
+  })
+}
+
+async function setHandler(req, res) {
+  let body
+  try {
+    body = JSON.parse(await readBody(req))
+  } catch {
+    sendJson(res, 400, { error: 'invalid JSON body' })
+    return
+  }
+  const key = body?.key
+  const value = body?.value
+  if (typeof key !== 'string' || !KEYS.includes(key)) {
+    sendJson(res, 400, { error: `unknown key: ${String(key)}` })
+    return
+  }
+  if (typeof value !== 'string' || !OPTIONS[key].some(([candidate]) => candidate === value)) {
+    sendJson(res, 400, { error: `unknown value for ${key}: ${String(value)}` })
+    return
+  }
+  const next = { ...readState(), [key]: value }
+  try {
+    writeState(next)
+    writePersonality(next)
+  } catch (error) {
+    sendJson(res, 500, { error: `write failed: ${error instanceof Error ? error.message : String(error)}` })
+    return
+  }
+  sendJson(res, 200, { values: next, preview: renderContext(next), rule: RULES[key]?.[value] ?? '' })
+}
+
+export function apply(ctx) {
+  ctx.systemPrompt.section({
+    name: 'local:personalization',
+    // 4000 sits after first-party guidance and around the same band the memory
+    // injector uses, so style rules follow the product's own writing rules.
+    order: 4000,
+    text: () => renderContext(readState()),
+  })
+
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: `${ROUTE}/config`, handler: configHandler }),
+    'dsh-personalization: config route',
+  )
+  ctx.effect(
+    () => ctx.webServer.register({ kind: 'exact', path: `${ROUTE}/set`, handler: setHandler }),
+    'dsh-personalization: set route',
+  )
+}

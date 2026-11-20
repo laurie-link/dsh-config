@@ -1,0 +1,508 @@
+/*
+ * dsh-live-page — injected overlay UI (badge, refresh, save status, toast, notice).
+ *
+ * Every rule is scoped to `dsh-live-` prefixed class names so the edited page
+ * keeps its own styles. The two classes applied to page blocks while editing
+ * (`dsh-live-hover`, `dsh-live-editing`) are stripped again before saving.
+ */
+
+.dsh-live-hud,
+.dsh-live-hud *,
+.dsh-live-notice,
+.dsh-live-notice *,
+.dsh-live-toast {
+  box-sizing: border-box;
+}
+
+.dsh-live-hud {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 2147483600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  color: #e2e8f0;
+}
+
+.dsh-live-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 74px;
+  margin: 0;
+  padding: 7px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 999px;
+  background: #0f766e;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(15, 23, 42, 0.28);
+  transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.dsh-live-badge:hover {
+  background: #0d9488;
+}
+
+.dsh-live-badge.is-off {
+  background: #475569;
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.22);
+}
+
+.dsh-live-badge.is-off:hover {
+  background: #64748b;
+}
+
+.dsh-live-badge:focus-visible,
+.dsh-live-notice-refresh:focus-visible {
+  outline: 2px solid #7dd3fc;
+  outline-offset: 2px;
+}
+
+.dsh-live-status {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  padding: 7px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.82);
+  color: #e2e8f0;
+  font: inherit;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dsh-live-status.is-idle {
+  color: #cbd5e1;
+}
+
+.dsh-live-status.is-dirty {
+  border-color: rgba(251, 191, 36, 0.45);
+  color: #fde68a;
+}
+
+.dsh-live-status.is-busy {
+  border-color: rgba(125, 211, 252, 0.45);
+  color: #bae6fd;
+}
+
+.dsh-live-status.is-ok {
+  border-color: rgba(52, 211, 153, 0.45);
+  color: #a7f3d0;
+}
+
+.dsh-live-status.is-warn {
+  border-color: rgba(251, 146, 60, 0.55);
+  background: rgba(124, 45, 18, 0.92);
+  color: #fed7aa;
+}
+
+.dsh-live-status.is-error {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(127, 29, 29, 0.92);
+  color: #fecaca;
+}
+
+.dsh-live-notice {
+  position: fixed;
+  top: 56px;
+  right: 12px;
+  z-index: 2147483600;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 12px;
+  border: 1px solid rgba(251, 146, 60, 0.55);
+  border-radius: 12px;
+  background: rgba(124, 45, 18, 0.96);
+  color: #fed7aa;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 12px;
+  line-height: 1.3;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.35);
+}
+
+.dsh-live-notice[hidden] {
+  display: none;
+}
+
+.dsh-live-notice-text {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dsh-live-notice-refresh {
+  margin: 0;
+  padding: 5px 9px;
+  border: 1px solid rgba(254, 215, 170, 0.5);
+  border-radius: 999px;
+  background: rgba(251, 146, 60, 0.22);
+  color: #ffedd5;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.dsh-live-notice-refresh:hover {
+  background: rgba(251, 146, 60, 0.4);
+}
+
+.dsh-live-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483600;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  border-radius: 12px;
+  background: rgba(127, 29, 29, 0.96);
+  color: #fee2e2;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 12px;
+  line-height: 1.5;
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.42);
+  cursor: default;
+}
+
+.dsh-live-toast.is-success {
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(6, 78, 59, 0.96);
+  color: #d1fae5;
+}
+
+.dsh-live-toast[hidden] {
+  display: none;
+}
+
+.dsh-live-hover {
+  outline: 2px dashed rgba(13, 148, 136, 0.6) !important;
+  outline-offset: 2px;
+  cursor: text;
+}
+
+.dsh-live-editing {
+  outline: 2px solid #0d9488 !important;
+  outline-offset: 2px;
+  background: rgba(240, 253, 250, 0.55) !important;
+  cursor: text;
+}
+
+@media (max-width: 640px) {
+  .dsh-live-hud {
+    top: 8px;
+    right: 8px;
+    gap: 4px;
+  }
+
+  .dsh-live-status {
+    display: none;
+  }
+
+  .dsh-live-notice {
+    top: 52px;
+    right: 8px;
+    left: 8px;
+    justify-content: space-between;
+  }
+}
+
+@media print {
+  .dsh-live-hud,
+  .dsh-live-notice,
+  .dsh-live-toast {
+    display: none !important;
+  }
+}
+
+/* -- inline completion ghost text (never part of the saved HTML) ---------- */
+.dsh-live-ghost-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483000;
+  display: none;
+  pointer-events: none;
+  font-family: inherit;
+}
+.dsh-live-ghost {
+  position: absolute;
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  opacity: 0.55;
+  pointer-events: none;
+  text-align: left;
+}
+.dsh-live-ghost-key {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font: 500 10px/15px ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+  letter-spacing: 0;
+  color: #fff;
+  background: rgba(64, 74, 96, 0.78);
+  opacity: 0.95;
+  vertical-align: baseline;
+  white-space: nowrap;
+}
+
+/* -- selection rewrite (floating trigger + instruction panel) ------------- */
+.dsh-live-rewrite-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2147483550;
+  pointer-events: none;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #e2e8f0;
+}
+
+.dsh-live-rewrite-layer [hidden] {
+  display: none !important;
+}
+
+.dsh-live-rewrite-trigger {
+  position: fixed;
+  pointer-events: auto;
+  margin: 0;
+  padding: 7px 12px;
+  border: 1px solid rgba(45, 212, 191, 0.55);
+  border-radius: 999px;
+  background: #0f766e;
+  color: #ffffff;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.35);
+  white-space: nowrap;
+}
+
+.dsh-live-rewrite-trigger:hover {
+  background: #0d9488;
+}
+
+.dsh-live-rewrite-undo {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  pointer-events: auto;
+  margin: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(251, 191, 36, 0.55);
+  border-radius: 10px;
+  background: rgba(69, 26, 3, 0.96);
+  color: #fde68a;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 10px 28px rgba(15, 23, 42, 0.35);
+}
+
+.dsh-live-rewrite-undo:hover {
+  background: rgba(120, 53, 15, 0.98);
+}
+
+.dsh-live-rewrite-panel {
+  position: fixed;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: calc(100vw - 24px);
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 14px;
+  background: rgba(11, 18, 32, 0.98);
+  color: #e2e8f0;
+  box-shadow: 0 18px 48px rgba(2, 6, 23, 0.5);
+  overflow-x: hidden;
+  overflow-y: auto;
+  backdrop-filter: blur(8px);
+}
+
+.dsh-live-rewrite-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.dsh-live-rewrite-heading {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.dsh-live-rewrite-close {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #94a3b8;
+  font: 16px/24px inherit;
+  cursor: pointer;
+}
+
+.dsh-live-rewrite-close:hover {
+  background: rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+}
+
+.dsh-live-rewrite-meta {
+  color: #94a3b8;
+  font-size: 11px;
+}
+
+.dsh-live-rewrite-input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 54px;
+  max-height: 140px;
+  resize: vertical;
+  margin: 0;
+  padding: 8px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 9px;
+  background: rgba(15, 23, 42, 0.9);
+  color: #f1f5f9;
+  font: inherit;
+  line-height: 1.45;
+}
+
+.dsh-live-rewrite-input:focus {
+  outline: 2px solid rgba(45, 212, 191, 0.6);
+  outline-offset: 1px;
+  border-color: rgba(45, 212, 191, 0.6);
+}
+
+.dsh-live-rewrite-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.dsh-live-rewrite-actions button {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+  background: rgba(30, 41, 59, 0.9);
+  color: #e2e8f0;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dsh-live-rewrite-actions button:hover {
+  background: rgba(51, 65, 85, 0.95);
+}
+
+.dsh-live-rewrite-actions button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.dsh-live-rewrite-actions .dsh-live-rewrite-run,
+.dsh-live-rewrite-actions .dsh-live-rewrite-apply {
+  border-color: rgba(45, 212, 191, 0.55);
+  background: #0f766e;
+  color: #ffffff;
+}
+
+.dsh-live-rewrite-actions .dsh-live-rewrite-run:hover,
+.dsh-live-rewrite-actions .dsh-live-rewrite-apply:hover {
+  background: #0d9488;
+}
+
+.dsh-live-rewrite-status {
+  min-height: 14px;
+  color: #94a3b8;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.dsh-live-rewrite-status.is-busy {
+  color: #bae6fd;
+}
+
+.dsh-live-rewrite-status.is-ok {
+  color: #a7f3d0;
+}
+
+.dsh-live-rewrite-status.is-error {
+  color: #fecaca;
+}
+
+.dsh-live-rewrite-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(42vh, 340px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.dsh-live-rewrite-item {
+  padding: 8px 9px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-left: 2px solid rgba(45, 212, 191, 0.65);
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.07);
+}
+
+.dsh-live-rewrite-label {
+  margin-bottom: 4px;
+  color: #94a3b8;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.dsh-live-rewrite-before {
+  margin-bottom: 5px;
+  color: #94a3b8;
+  text-decoration: line-through;
+  text-decoration-color: rgba(248, 113, 113, 0.55);
+  overflow-wrap: anywhere;
+}
+
+.dsh-live-rewrite-after {
+  color: #f8fafc;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.dsh-live-rewrite-after.is-empty {
+  color: #fca5a5;
+  font-style: italic;
+}
+
+@media (max-width: 640px) {
+  .dsh-live-rewrite-panel {
+    left: 8px !important;
+    right: 8px;
+    width: auto !important;
+  }
+}
+
+@media print {
+  .dsh-live-rewrite-layer {
+    display: none !important;
+  }
+}

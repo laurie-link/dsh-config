@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session search",
+    "description": "A conversation search palette under the automated-tasks row: lists recent conversations, matches both session titles and message content, and opens any result with one click. Replaces the shipped workspace search icon."
+  }
+}

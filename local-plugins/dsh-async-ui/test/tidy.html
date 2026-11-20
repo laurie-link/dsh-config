@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>async-ui 图集整齐度夹具</title>
+<style>
+  /* The rules below are copied verbatim from GenUI's gallery.module.css, so the
+     beforeEach state matches what the chat pane really renders. */
+  body { margin: 0; padding: 24px; background: #16181d; color: #e6e9ef;
+         font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+  .pane { width: 760px; }
+  .imageGrid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .imageTile {
+    flex: var(--gallery-image-ratio, 1.333) 1 calc(var(--gallery-image-ratio, 1.333) * 160px);
+    min-width: min(100%, 160px);
+    max-width: 100%;
+    margin: 0;
+  }
+  .thumbnail {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    aspect-ratio: var(--gallery-image-ratio, 1.333);
+    max-height: min(50vh, 360px);
+    min-height: 100px;
+    overflow: hidden;
+    border: 1px solid #2c313a;
+    border-radius: 12px;
+    padding: 0;
+    background: #1c1f26;
+    color: inherit;
+    font: inherit;
+    cursor: zoom-in;
+  }
+  .thumbnailImage { width: 100%; height: 100%; object-fit: cover; display: block; }
+  figcaption { margin-top: 6px; font-size: 12px; color: #8b93a3; }
+  h2 { font-size: 13px; color: #8b93a3; margin: 28px 0 10px; font-weight: 500; }
+</style>
+</head>
+<body>
+<div class="pane" data-genui>
+  <h2>混排：竖图 + 横图 + 方图（改前是这种参差）</h2>
+  <div class="imageGrid" id="grid">
+    <figure class="imageTile" style="--gallery-image-ratio:0.75">
+      <button class="thumbnail" type="button"><img class="thumbnailImage" src="http://127.0.0.1:62700/async-img?q=埃菲尔铁塔&w=900"></button>
+      <figcaption>埃菲尔铁塔</figcaption>
+    </figure>
+    <figure class="imageTile" style="--gallery-image-ratio:1.78">
+      <button class="thumbnail" type="button"><img class="thumbnailImage" src="http://127.0.0.1:62700/async-img?q=外滩&w=900"></button>
+      <figcaption>外滩</figcaption>
+    </figure>
+    <figure class="imageTile" style="--gallery-image-ratio:1">
+      <button class="thumbnail" type="button"><img class="thumbnailImage" src="http://127.0.0.1:62700/async-img?q=提拉米苏&w=900"></button>
+      <figcaption>提拉米苏</figcaption>
+    </figure>
+    <figure class="imageTile" style="--gallery-image-ratio:0.6">
+      <button class="thumbnail" type="button"><img class="thumbnailImage" src="http://127.0.0.1:62700/async-img?q=烤羊肩&w=900"></button>
+      <figcaption>烤羊肩（占位）</figcaption>
+    </figure>
+  </div>
+
+  <h2>条目行：row + col(18) + 缩略图（看它是否仍是正方、不超高）</h2>
+  <div class="imageGrid" id="rowgrid" style="gap:14px">
+    <div class="col" style="flex:0 1 18%;width:18%">
+      <figure class="imageTile" style="--gallery-image-ratio:0.68">
+        <button class="thumbnail" type="button"><img class="thumbnailImage" src="http://127.0.0.1:62700/async-img?q=音波龙&w=900"></button>
+      </figure>
+    </div>
+    <div class="col" style="flex:1 1 auto;width:auto">
+      <p style="margin:0;font-size:14px;line-height:1.6">音波龙 No.715 · 飞行 / 龙<br>速度极快的洞穴猎手，靠声波定位。</p>
+    </div>
+  </div>
+
+  <h2>普通 image 节点（不该被图块规则碰到）</h2>
+  <div id="plain"><img src="http://127.0.0.1:62700/async-img?q=外滩&w=400" style="max-width:320px"></div>
+
+  <h2>灯箱里的 figure（不能被当成图块）</h2>
+  <dialog id="lb" style="width:80vw;height:70vh">
+    <figure id="expanded" style="margin:0;display:flex;align-items:center;justify-content:center;height:100%">
+      <img src="http://127.0.0.1:62700/async-img?q=埃菲尔铁塔&w=900" style="max-width:100%;max-height:100%">
+    </figure>
+  </dialog>
+  <button type="button" onclick="document.getElementById('lb').showModal()">open lightbox</button>
+</div>
+
+<script>
+  // Minimal module-table shim: client.js is a browser module, not a script.
+  window.__ModuleLoader__ = {
+    load(entry) {
+      const imports = {}
+      const require = (spec) => {
+        if (imports[spec] !== undefined) return imports[spec]
+        throw new Error('stub: no module ' + spec)
+      }
+      require.async = () => Promise.reject(new Error('stub: async disabled'))
+      const module = entry.factory(require)
+      if (module !== undefined && typeof module.apply === 'function') {
+        module.apply({ effect(run) { run() } })
+        window.__asyncUiApplied = true
+      }
+    },
+  }
+</script>
+<script src="../client.js?v=20261114-tidy"></script>
+</body>
+</html>

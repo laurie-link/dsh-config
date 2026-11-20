@@ -1,0 +1,5 @@
+# dsh-live-page：把工作区 HTML 作为真实页面开在 IDE 浏览器里直接编辑，
+# 并把当前浏览器页面/选中文本送进对话。
+- insert:
+    - id: dsh-live-page
+      name: 'dsh-live-page'

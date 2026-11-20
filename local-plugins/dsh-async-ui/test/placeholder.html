@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>async-ui placeholder harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:28px; font:15px/1.6 -apple-system,"PingFang SC",sans-serif;
+         background:#0f1115; color:#e6e8ee; }
+  .card { max-width:640px; margin:0 auto; background:#171a21; border:1px solid #262b36;
+          border-radius:14px; padding:18px; }
+  .title { font-weight:600; font-size:15px; margin-bottom:10px; }
+  .text { color:#a8b0c0; font-size:14px; margin-bottom:14px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  figure { margin:0; }
+  img { display:block; width:100%; border-radius:10px; }
+  figcaption { font-size:12px; color:#7d879a; margin-top:6px; }
+</style></head>
+<body>
+  <div class="card">
+    <div class="title">ChatGPT 式 AsyncImage（占位自测）</div>
+    <div class="text">左图故意慢 3 秒，右图走真实解析路由。占位块应当先撑住版面。</div>
+    <div class="grid">
+      <figure>
+        <img src="http://127.0.0.1:59999/async-ui-img?q=slow&w=900&r=1794572824191" alt="慢图">
+        <figcaption>慢图（3s 后才 302）</figcaption>
+      </figure>
+      <figure>
+        <img src="http://127.0.0.1:55786/async-ui-img?q=%E5%B1%B1%E9%97%B4%20%E5%B8%90%E7%AF%B7%20%E6%98%9F%E7%A9%BA&w=900" alt="雪山日出">
+        <figcaption>雪山日出（真实路由）</figcaption>
+      </figure>
+    </div>
+  </div>
+<script>
+  window.__log = []
+  const t0 = performance.now()
+  new MutationObserver(recs => {
+    for (const r of recs) if (r.attributeName) window.__log.push([Math.round(performance.now()-t0), r.target.tagName, r.attributeName])
+  }).observe(document.documentElement, { attributes: true, subtree: true, attributeOldValue: false })
+  addEventListener('load', e => { if (e.target.tagName === 'IMG') window.__log.push([Math.round(performance.now()-t0), 'IMG:load', e.target.alt]) }, true)
+  addEventListener('error', e => { if (e.target.tagName === 'IMG') window.__log.push([Math.round(performance.now()-t0), 'IMG:error', e.target.alt]) }, true)
+</script>
+<script>
+  // Minimal stand-in for the App's module loader so client.js runs unmodified.
+  window.__ModuleLoader__ = { load({ id, factory }) {
+    const mod = factory(() => { throw new Error('no require in harness') })
+    const ctx = { effect(fn) { window.__asyncUiDispose = fn() } }
+    mod.apply(ctx)
+    window.__asyncUiLoaded = id
+  } }
+</script>
+<script src="../client.js?v=1794572824"></script>
+</body></html>

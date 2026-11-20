@@ -1,0 +1,24 @@
+# dsh-compaction-retry bundle patch: mount the plugin row.
+#
+# 策略字段与 @deepseek-ai/dsh-llm-retry 的 retryPolicy 同名同义：
+#   mode: normal | always        normal 有次数上限，always 无限重试直到成功/取消
+#   maxRetries: normal 模式的重试次数上限（不含第一次请求）
+#   retryableCodes: 可重试的 provider-neutral 错误码
+#   backoff: 本地指数退避（provider 给了 Retry-After 时优先用它，且不超过 maxDelayMs）
+# 这里默认按本机 opencode-go 的 retryPolicy 配成同一套数值；要单独调压缩重试就改这段。
+- insert:
+    - id: compaction-retry
+      name: 'dsh-compaction-retry'
+      config:
+        mode: normal
+        maxRetries: 1000
+        retryableCodes:
+          - TRANSPORT
+          - RATE_LIMIT
+          - SERVER
+          - TIMEOUT
+          - EMPTY_RESPONSE
+        backoff:
+          initialDelayMs: 5000
+          maxDelayMs: 60000
+          jitterRatio: 0.2

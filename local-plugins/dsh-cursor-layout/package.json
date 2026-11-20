@@ -1,0 +1,34 @@
+{
+  "name": "dsh-cursor-layout",
+  "version": "0.5.16",
+  "private": true,
+  "type": "module",
+  "description": "Cursor/VSCode-style DSH workbench layout: the right-hand workbench column (Monaco editor, file tree, browser, terminal, diff review) is the wide middle pane and the AI conversation a fixed-width right column, with a header pill + shortcut (⌘⌥M) to flip back to the native Agent view (centred conversation, workbench hidden). A Cursor-style changed-files bar above the composer lists the files this conversation changed with Undo / Keep / Review and matches the composer width; clicking one of its file rows or Review projects a visible target first (agent view: media opens the right-hand peek preview, text switches back to the IDE view with the diff focused; binary records open the file itself) instead of opening in the hidden workbench column. In the Agent view, clicking a video/image link opens the VSCode editor preview docked on the RIGHT instead of switching to the IDE view. Clicking the native changed-files card (data-changed-files) switches to the IDE view first so its review tab lands in the visible workbench instead of the hidden column. Clicking a delivered-file card (data-presented-file) opens that file in the IDE view's editor tab - code, images and videos alike - instead of an official sidebar tab in the hidden workbench, and the editor's left rail switches to its file tree so the file's location is expanded and highlighted. A session with no open editor files falls back to the Agent view, and closing the last file tab switches back to it automatically.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

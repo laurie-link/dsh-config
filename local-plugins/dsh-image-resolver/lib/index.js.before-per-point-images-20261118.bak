@@ -1,0 +1,1064 @@
+/**
+ * @local/dsh-image-resolver — AsyncImage 式的宿主补图层 v0.2。
+ *
+ * 模型在 GenUI 围栏里只写一句画面描述：
+ *   {"type":"image","src":"/img-resolve?q=slow+roasted+lamb+shoulder","alt":"..."}
+ * 浏览器请求这个同源相对地址时，本插件在宿主侧搜图，然后 302 到真实图片 URL。
+ *
+ * v0.2 起不再只用 Wikimedia：优先借用同 profile 里 dsh-image-hunt 的 14 个图源
+ * （百度 / Bing / 360 / 堆糖 / 花瓣 / DuckDuckGo / Yandex / Openverse / Wikimedia /
+ * Pixiv / Wallhaven / Konachan / Safebooru / Iconify），拿不到时才退回内置
+ * 的 Wikimedia 检索。image-hunt 是可选依赖：找不到就用兜底，不会因此挂掉。
+ */
+
+import { createRequire } from 'node:module'
+import os from 'node:os'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
+export const name = '@local/dsh-image-resolver'
+
+/** 没有硬依赖：webServer 是可选服务，用 inject 纤维延后绑定。 */
+export const inject = []
+
+/** 路由前缀；命中后由本插件独占，不会被 /plugins 或 SPA 兜底抢走。 */
+const ROUTE_PATH = '/img-resolve'
+
+/** 内置兜底上游：Wikimedia Commons（免 key、CC 授权、结果稳定）。 */
+const UPSTREAM = 'https://commons.wikimedia.org/w/api.php'
+const USER_AGENT = 'dsh-image-resolver/0.2 (DSH GenUI host route)'
+
+/** 结果缓存：同一个描述在一次会话里基本是重复请求。 */
+const cache = new Map()
+const CACHE_TTL_MS = 30 * 60 * 1000
+const CACHE_MAX = 500
+
+const DEFAULT_WIDTH = 900
+const MAX_WIDTH = 1600
+const MAX_QUERY = 200
+
+/** 一次解析的总预算：图搜会并行打多个源，超时就退回兜底。 */
+const RESOLVE_BUDGET_MS = 6000
+
+const IMAGE_MIME = /^image\/(?:jpeg|png|webp|gif|avif)$/i
+
+/* The card is a square crop, so a wide poster loses most of its pixels to the
+   crop and a tall card is blown up from a slice. Both look wrong next to a
+   dedicated artwork, which is why geometry is scored, not just "big enough". */
+const MIN_CANDIDATE_SIDE = 320
+
+function cacheGet(key) {
+  const hit = cache.get(key)
+  if (hit === undefined) return undefined
+  if (Date.now() - hit.at > CACHE_TTL_MS) {
+    cache.delete(key)
+    return undefined
+  }
+  return hit.url
+}
+
+function cacheSet(key, url) {
+  if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next()
+    if (!oldest.done) cache.delete(oldest.value)
+  }
+  cache.set(key, { url, at: Date.now() })
+}
+
+/* ---------------- dsh-image-hunt（可选） ---------------- */
+
+let huntPromise
+
+/** 在 profile 里找 dsh-image-hunt；找不到返回 undefined。 */
+function loadImageHunt() {
+  if (huntPromise !== undefined) return huntPromise
+  huntPromise = (async () => {
+    const bases = [
+      process.env.DSH_PROFILE_DIR,
+      path.join(os.homedir(), '.dsh', 'profiles', 'desktop'),
+      process.cwd(),
+    ].filter((base) => typeof base === 'string' && base !== '')
+
+    for (const base of bases) {
+      try {
+        const require = createRequire(path.join(base, 'package.json'))
+        const entry = require.resolve('dsh-image-hunt')
+        const mod = await import(pathToFileURL(entry).href)
+        if (typeof mod.searchAll === 'function') {
+          const bing = Array.isArray(mod.SOURCES) ? mod.SOURCES.find(source => source.id === 'bing') : undefined
+          if (bing !== undefined) bing.foreign = true
+          return mod
+        }
+      } catch {
+        // 该 base 下没有 image-hunt，换下一个。
+      }
+    }
+    return undefined
+  })().then((mod) => mod ?? null)
+  return huntPromise
+}
+
+/** 从 image-hunt 的结果里挑一张：优先够宽的原图，其次缩略图。 */
+function pickHuntResult(results, width) {
+  const usable = results.filter((item) => {
+    const url = item?.full || item?.thumb
+    return typeof url === 'string' && /^https?:\/\//i.test(url)
+  })
+  if (usable.length === 0) return undefined
+  const wide = usable.find((item) => (item.width || 0) >= Math.min(width, 1200))
+  const pick = wide ?? usable[0]
+  return pick.full ?? pick.thumb
+}
+
+/* ---------------- 候选校验：标题/来源页必须真的提到查询 ---------------- */
+
+/**
+ * Words that carry no subject: dropping them keeps the matcher from accepting
+ * "pokemon wallpaper" pages for every Pokemon query.
+ */
+const STOPWORDS = new Set([
+  'pokemon', 'pokémon', 'image', 'images', 'photo', 'photos', 'picture', 'pictures',
+  'png', 'jpg', 'jpeg', 'webp', 'wallpaper', 'wallpapers', 'hd', '4k', '8k',
+  'art', 'artwork', 'fanart', 'official', 'render', 'transparent',
+  /* Scene words describe the shot, not the subject: "GTA V screenshot" is
+     about GTA V, and a page that never says "screenshot" can still show it. */
+  'screenshot', 'screenshots', 'gameplay', 'cover', 'boxart', 'keyart', 'poster', 'trailer',
+  'the', 'and', 'with', 'for', 'from', 'of', 'a', 'an', 'in', 'on', 'to',
+  '图片', '高清', '壁纸', '素材', '头像', '图鉴', '原图',
+])
+
+/** Pages whose titles are curated entity names, so a hit means the right subject. */
+const TRUSTED_HOSTS = /(^|\.)(wikipedia\.org|wikimedia\.org|fandom\.com|wikia\.com|bulbapedia\.biz|bulbagarden\.net|pokemondb\.net|pokemon\.com|serebii\.net|veekun\.com|rotomlabs\.net|marriland\.com|leekduck\.com|pokemongohub\.net|gamepress\.gg|smogon\.com|dexerto\.com|eurogamer\.net|ign\.com|gamesradar\.com|polygon\.com|rockstargames\.com|nianticlabs\.com|nintendo\.com|playstation\.com|xbox\.com|photophoto\.cn|588ku\.com|redocn\.com|gematsu\.com|gtabase\.com)$/i
+
+/**
+ * Hosts whose pictures are the wrong kind of picture even when the title names
+ * the subject: watermarked stock, AI renders, fan art and merchandise (a GTA VI
+ * phone case is titled "GTA VI" too). Never accepted, whatever the title says.
+ */
+const BLOCKED_HOSTS = /(^|\.)(shutterstock\.com|alamy\.com|dreamstime\.com|123rf\.com|istockphoto\.com|gettyimages\.[a-z.]+|depositphotos\.com|vectorstock\.com|stock\.adobe\.com|ftcdn\.net|canstockphoto\.com|bigstockphoto\.com|pond5\.com|freepik\.com|vecteezy\.com|lexica\.art|openart\.ai|nightcafe\.studio|civitai\.com|playgroundai\.com|prompthero\.com|starryai\.com|craiyon\.com|tensor\.art|seaart\.ai|pixai\.art|deviantart\.com|deviantart\.net|wixmp\.com|artstation\.com|redbubble\.com|teepublic\.com|etsy\.com|etsystatic\.com|aliexpress\.[a-z.]+|alicdn\.com|amazon\.[a-z.]+|media-amazon\.com|ssl-images-amazon\.com|ebay\.[a-z.]+|ebayimg\.com|temu\.com|kwcdn\.com|zazzle\.com|taobao\.com|tmall\.com|jd\.com|360buyimg\.com|yangkeduo\.com)$/i
+
+/** Reposts and video thumbnails: usually the right subject, rarely the best picture. */
+const LOW_TRUST_HOSTS = /(^|\.)(pinterest\.[a-z.]+|pinimg\.com|youtube\.com|ytimg\.com|reddit\.com|redd\.it|redditmedia\.com|tiktok\.com|tiktokcdn\.com|facebook\.com|fbcdn\.net|instagram\.com|cdninstagram\.com|twitter\.com|twimg\.com|x\.com|quora\.com)$/i
+
+
+function normalizeMatchText(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+}
+
+function safeDecode(value) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+/** Distinctive words of a query, lower-cased, stopwords removed. */
+function subjectTokens(query) {
+  const normalized = normalizeMatchText(query).trim()
+  const raw = normalized.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+
+  /* GTA is an identity-bearing abbreviation for Grand Theft Auto. */
+  if (/^(?:grand theft auto|gta)\s+(?:i{1,3}|iv|v|vi|vii|viii|ix|x|\d+)$/i.test(normalized)) {
+    return ['gta', raw[raw.length - 1]]
+  }
+
+  const original = String(query ?? '').normalize('NFKC')
+  const explicitRoman = new Set(original.split(/[^\p{L}\p{N}]+/u)
+    .filter(token => token === token.toUpperCase() && /^(?:I|V|X|L|C|D|M)$/.test(token))
+    .map(token => normalizeMatchText(token)))
+
+  return [...new Set(raw
+    .filter(token => token !== '' && !STOPWORDS.has(token))
+    .filter(token => (/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(token)
+      ? token.length >= 2
+      : token.length >= 2 || /^\d+$/.test(token) || explicitRoman.has(token))))]
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname
+  } catch {
+    return ''
+  }
+}
+
+
+/**
+ * Score a candidate by whether its title/source page actually mentions the
+ * query subject. Returns undefined when the candidate is off-topic.
+ */
+/**
+ * True when `token` appears in `hay` as a standalone word.
+ *
+ * Latin text needs the plain substring test. CJK has no word boundaries, so a
+ * bare substring test let "三合一磁怪" pass for the query "小磁怪" — the
+ * occurrence only counts when it is not glued to another CJK character.
+ */
+const ROMAN_NUMERAL_ALIASES = {
+  i: '1', ii: '2', iii: '3', iv: '4', v: '5',
+  vi: '6', vii: '7', viii: '8', ix: '9', x: '10',
+}
+
+function containsBounded(hay, token) {
+  if (/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(token)) {
+    /* Exact CJK name phrases can sit inside a Chinese sentence. */
+    return hay.includes(token)
+  }
+
+  const variants = [token]
+  if (token === 'gta') variants.push('grand theft auto')
+  if (ROMAN_NUMERAL_ALIASES[token] !== undefined) variants.push(ROMAN_NUMERAL_ALIASES[token])
+  const roman = Object.keys(ROMAN_NUMERAL_ALIASES).find(key => ROMAN_NUMERAL_ALIASES[key] === token)
+  if (roman !== undefined) variants.push(roman)
+
+  const isWord = ch => ch !== '' && /[\p{L}\p{N}]/u.test(ch)
+  return variants.some(value => {
+    let from = 0
+    while (true) {
+      const at = hay.indexOf(value, from)
+      if (at < 0) return false
+      const before = at === 0 ? '' : hay[at - 1]
+      const after = hay[at + value.length] ?? ''
+      if (!isWord(before) && !isWord(after)) return true
+      from = at + 1
+    }
+  })
+}
+
+/** Turn a page URL into searchable text: path segments become separate words. */
+function urlText(page) {
+  try {
+    const url = new URL(page)
+    return `${url.hostname} ${safeDecode(url.pathname).replace(/[/_.-]+/g, ' ')} ${safeDecode(url.search).replace(/[/_=&?-]+/g, ' ')}`
+  } catch {
+    return safeDecode(String(page))
+  }
+}
+
+
+function imagePathText(imageUrl) {
+  try {
+    return safeDecode(new URL(imageUrl).pathname).replace(/[/_.-]+/g, ' ')
+  } catch {
+    return safeDecode(String(imageUrl ?? ''))
+  }
+}
+
+function geometryScore(width, height) {
+  if (!(width > 0) || !(height > 0)) return 0
+  const short = Math.min(width, height)
+  if (short < MIN_CANDIDATE_SIDE) return -6
+  const ratio = Math.max(width, height) / short
+  /* Full marks at 1:1, fading to nothing at 2:1: the square crop keeps the whole
+     picture only when the picture is already close to square. */
+  const square = Math.max(0, 1 - Math.abs(ratio - 1))
+  const room = Math.min(2, Math.log2(short / MIN_CANDIDATE_SIDE))
+  return square * 2.5 + room
+}
+
+/* ---------------- 身份核验：形态 / 代际冲突一票否决，来源分两级 ---------------- */
+
+/**
+ * Variant words that change which picture is right. "Mega Houndoom" and
+ * "Houndoom" are different pictures; so are "Zamazenta" and "Zamazenta
+ * Crowned Shield". Region names are folded onto their adjective form.
+ */
+const FORM_MARKERS = new Set([
+  'mega', 'shadow', 'purified', 'dynamax', 'gigantamax', 'eternamax', 'galarian', 'alolan',
+  'hisuian', 'paldean', 'primal', 'shiny', 'crowned', 'origin', 'therian', 'incarnate', 'ultra', 'apex',
+])
+const FORM_ALIASES = { gmax: 'gigantamax', galar: 'galarian', alola: 'alolan', hisui: 'hisuian', paldea: 'paldean' }
+const CJK_FORM_MARKERS = ['超级', '暗影', '超极巨化', '极巨化', '伽勒尔', '阿罗拉', '洗翠', '帕底亚', '原始', '异色', '色违', '闪光']
+const CJK_RANGE = /[㐀-鿿぀-ヿ가-힯]/
+
+/* "i" stays a word: it is far more often the pronoun than the numeral. */
+const ROMAN_DIGITS = { ii: '2', iii: '3', iv: '4', v: '5', vi: '6', vii: '7', viii: '8', ix: '9', x: '10' }
+
+/** Words of a text on one footing: GTA V and Grand Theft Auto 5 both read "gta 5". */
+function canonicalWords(text) {
+  return normalizeMatchText(text)
+    .replace(/grand\s+theft\s+auto/g, 'gta')
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean)
+    .map(word => ROMAN_DIGITS[word] ?? FORM_ALIASES[word] ?? word)
+}
+
+/** "<word> <number>" pairs whose number is part of the identity: gta 6, iphone 17. */
+function numberedPairs(words) {
+  const pairs = []
+  for (let i = 1; i < words.length; i += 1) {
+    if (/^\d+$/.test(words[i]) && !/^\d+$/.test(words[i - 1])) pairs.push([words[i - 1], words[i]])
+  }
+  return pairs
+}
+
+/**
+ * Everything the identity checks need about one subject, computed once.
+ *
+ * `names` are the words that identify the subject, `forms` the variant words it
+ * carries, `numbered` the version pairs that must not change, and `context`
+ * the extra query words ("leonida", "los santos") that rank a picture of the
+ * right scene above a generic one without ever deciding identity.
+ */
+function subjectProfile(subject, query = subject) {
+  const words = canonicalWords(subject).filter(word => !STOPWORDS.has(word))
+  const forms = new Set(words.filter(word => FORM_MARKERS.has(word)))
+  const names = new Set(words.filter(word => !FORM_MARKERS.has(word)))
+  const tokens = subjectTokens(subject)
+  const context = [...new Set(canonicalWords(query))].filter(word => word.length >= 3
+    && !STOPWORDS.has(word) && !names.has(word) && !forms.has(word) && !/^\d+$/.test(word))
+  const text = String(subject ?? '')
+  return {
+    tokens,
+    forms,
+    names,
+    numbered: numberedPairs(canonicalWords(subject)),
+    context,
+    cjk: tokens.filter(token => CJK_RANGE.test(token)),
+    cjkForms: CJK_FORM_MARKERS.filter(marker => !text.includes(marker)),
+  }
+}
+
+/**
+ * True when a candidate names the subject but is about a sibling of it.
+ *
+ * These are the mix-ups a reader notices first, so they veto a candidate from
+ * any source, trusted or not:
+ *  - a form the subject does not have, attached to its name ("Mega Houndoom"
+ *    for Houndoom), in the title or the picture's own filename;
+ *  - a form the subject has, but attached to something else ("Houndoom vs
+ *    Mega Gengar" for Mega Houndoom);
+ *  - the same series with another number ("GTA 5 vs GTA 6" for GTA 6);
+ *  - a Chinese form prefix glued to the name (超级黑鲁加 for 黑鲁加).
+ */
+function identityConflict({ title = '', image = '', page = '' }, profile) {
+  const titleWords = canonicalWords(title)
+  const attached = (words, i) => [words[i - 1], words[i + 1]]
+    .some(word => word !== undefined && (profile.names.has(word) || profile.forms.has(word)))
+  for (const words of [titleWords, canonicalWords(image)]) {
+    for (let i = 0; i < words.length; i += 1) {
+      if (FORM_MARKERS.has(words[i]) && !profile.forms.has(words[i]) && attached(words, i)) return true
+    }
+  }
+  if (profile.forms.size > 0) {
+    const fields = [titleWords, canonicalWords(image), canonicalWords(page)]
+    for (const form of profile.forms) {
+      if (!fields.some(words => words.some((word, i) => word === form && attached(words, i)))) return true
+    }
+  }
+  for (const [lead, number] of profile.numbered) {
+    for (let i = 0; i + 1 < titleWords.length; i += 1) {
+      if (titleWords[i] === lead && /^\d+$/.test(titleWords[i + 1]) && titleWords[i + 1] !== number) return true
+    }
+  }
+  const titleText = normalizeMatchText(title)
+  return profile.cjk.some(token => profile.cjkForms.some(marker => titleText.includes(marker + token)))
+}
+
+/** Registrable-ish domain, so img1.example.com and www.example.com count once. */
+function siteOf(url) {
+  const host = hostOf(url)
+  return host.split('.').slice(-2).join('.')
+}
+
+/**
+ * Judge one search hit. Returns `{ score, tier }`, or undefined when it is
+ * off-topic, from a blocked host, or about a sibling of the subject.
+ *
+ * Two tiers:
+ *  - `trusted`: the page or picture lives on a curated host, and the subject
+ *    words show up in its title, page URL or filename. A title hit is worth
+ *    more than a URL hit: every Pokédex site has a generic "Pokédex" title,
+ *    so the URL is the only grounding those pages offer.
+ *  - `title`: any other host, but then the title alone has to carry every
+ *    subject word. This is where most correct pictures of characters, places
+ *    and scenes live — the trusted list rejected all 24 hits for "Lucia
+ *    Caminos" although half of them named her outright. The caller still
+ *    demands two independent sites before believing this tier.
+ */
+function judgeCandidate(candidate, profile, rank = 0) {
+  const tokens = profile.tokens
+  if (tokens.length === 0) return undefined
+  const imageUrl = candidate.full || candidate.thumb
+  const titleHay = normalizeMatchText(candidate.title ?? '')
+  const urlHay = normalizeMatchText(urlText(candidate.page))
+  const imageHay = normalizeMatchText(imagePathText(imageUrl))
+  if (titleHay.trim() === '' && urlHay.trim() === '' && imageHay.trim() === '') return undefined
+
+  const pageHost = hostOf(candidate.page)
+  const imageHost = hostOf(imageUrl)
+  if (BLOCKED_HOSTS.test(pageHost) || BLOCKED_HOSTS.test(imageHost)) return undefined
+  if (identityConflict({ title: candidate.title, image: imagePathText(imageUrl), page: urlText(candidate.page) }, profile)) {
+    return undefined
+  }
+
+  let matched = 0
+  let titleMatched = 0
+  let urlMatched = 0
+  let imageMatched = 0
+  let subjectHit = false
+  for (const token of tokens) {
+    const inTitle = containsBounded(titleHay, token)
+    const inUrl = containsBounded(urlHay, token)
+    const inImage = containsBounded(imageHay, token)
+    if (inTitle || inUrl || inImage) matched += 1
+    if (inTitle) titleMatched += 1
+    if (inUrl) urlMatched += 1
+    if (inImage) imageMatched += 1
+    if (token === tokens[tokens.length - 1] && (inTitle || inUrl || inImage)) subjectHit = true
+  }
+  const coverage = matched / tokens.length
+
+  const contextHits = profile.context.filter(word => containsBounded(titleHay, word)).length
+  const shared = geometryScore(candidate.width, candidate.height)
+    + Math.max(0, 3 - rank * 0.6)
+    + Math.min(3, contextHits)
+
+  const trusted = TRUSTED_HOSTS.test(pageHost) || TRUSTED_HOSTS.test(imageHost)
+  if (trusted && subjectHit && coverage >= 0.8) {
+    let score = coverage * 12 + titleMatched * 1.5 + urlMatched * 0.5 + imageMatched * 1.25 + 4 + shared
+    if (titleHay.length > 0 && titleHay.length <= 60) score += 0.5
+    return { score, tier: 'trusted' }
+  }
+  if (titleMatched === tokens.length) {
+    let score = 6 + titleMatched + shared
+    if (LOW_TRUST_HOSTS.test(pageHost) || LOW_TRUST_HOSTS.test(imageHost)) score -= 3
+    return { score, tier: 'title' }
+  }
+  return undefined
+}
+
+/**
+ * Judge every hit, then rank what survives.
+ *
+ * One stray page can carry any title; two unrelated sites agreeing that a
+ * picture shows the subject is what makes an untrusted title believable. So
+ * the `title` tier only counts when at least two sites made it through.
+ */
+function rankCandidates(results, profile) {
+  const judged = []
+  results.forEach((item, rank) => {
+    const url = item?.full || item?.thumb
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return
+    const verdict = judgeCandidate(item, profile, rank)
+    if (verdict !== undefined) judged.push({ item, ...verdict })
+  })
+  const sites = new Set(judged.map(entry => siteOf(entry.item.page) || siteOf(entry.item.full || entry.item.thumb)))
+  const kept = sites.size >= 2 ? judged : judged.filter(entry => entry.tier === 'trusted')
+  return kept.sort((a, b) => b.score - a.score)
+}
+
+/** How many verified candidates one search hands back; the route tries them in order. */
+const MAX_CANDIDATES = 8
+
+/** A page-bound lead image is one candidate among several, so its page gets a short leash. */
+const PAGE_BIND_TIMEOUT_MS = 4000
+
+/** Once one engine has answered, the others get this long to catch up. */
+const STRAGGLER_GRACE_MS = 1500
+
+/**
+ * Search each engine on its own clock and pool what arrives.
+ *
+ * `searchAll` with several sources settles only when the slowest engine does,
+ * so one engine stuck on a captcha page (DuckDuckGo does this) threw away
+ * Bing's perfectly good answer along with it. Here every engine races the
+ * budget on its own, and once one has hits the rest get a short grace.
+ * Results are interleaved the way `searchAll` does it.
+ */
+async function pooledSearch(hunt, query, opts) {
+  const ids = Array.isArray(opts.sources) && opts.sources.length > 0 ? opts.sources : [opts.engine]
+  const buckets = ids.map(() => [])
+  await new Promise((resolve) => {
+    let pending = ids.length
+    let grace
+    const budget = setTimeout(resolve, RESOLVE_BUDGET_MS)
+    const finish = () => {
+      clearTimeout(budget)
+      clearTimeout(grace)
+      resolve()
+    }
+    ids.forEach((id, index) => {
+      const pick = opts.sources !== undefined && opts.sources.length > 0 ? { sources: [id] } : { engine: id }
+      Promise.resolve()
+        .then(() => hunt.searchAll(query, { limit: opts.limit, minPixels: opts.minPixels ?? 0, ...pick }))
+        .then((found) => { buckets[index] = found?.results ?? [] }, () => {})
+        .finally(() => {
+          pending -= 1
+          if (pending === 0) finish()
+          else if (grace === undefined && buckets[index].length > 0) grace = setTimeout(finish, STRAGGLER_GRACE_MS)
+        })
+    })
+  })
+  const merged = []
+  const seen = new Set()
+  const longest = Math.max(0, ...buckets.map(bucket => bucket.length))
+  for (let i = 0; i < longest; i += 1) {
+    for (const bucket of buckets) {
+      const item = bucket[i]
+      if (item === undefined) continue
+      const key = String(item.full || item.thumb || '').split('?')[0]
+      if (key === '' || seen.has(key)) continue
+      seen.add(key)
+      merged.push(item)
+    }
+  }
+  return merged
+}
+
+/**
+ * Every verified candidate for one query, best first.
+ *
+ * The route used to get exactly one URL per search plan; when that URL
+ * answered 403 the whole plan was lost and a slower plan started from
+ * scratch. With the ranked list the caller falls through to the next picture
+ * of the same search instead.
+ *
+ * Picture candidates carry `url` (the original), `thumb` (the engine's own
+ * copy, which almost never refuses a hotlink) and `referer`. Page candidates
+ * (`kind: 'page'` — the official page, or a trusted article naming the
+ * subject) carry only the page: its lead image is looked up with
+ * `pageLeadImage` when the caller gets to it, so a slow article never holds
+ * back the search results. All carry title/page/engine/score/tier for the
+ * source line and for debugging.
+ *
+ * @param {string} query
+ * @param {number} [width]
+ * @param {{ subject?: string, engine?: string, sources?: string[], minPixels?: number, limit?: number, max?: number }} [opts]
+ * @returns {Promise<Array<{ kind?: 'page', url: string, thumb?: string, referer?: string, title: string, page: string, engine: string, score: number, tier: string }>>}
+ */
+export async function resolveImageCandidates(query, width = DEFAULT_WIDTH, opts = {}) {
+  const subject = String(opts.subject ?? query).trim()
+  const profile = subjectProfile(subject, query)
+  if (profile.tokens.length === 0) return []
+  const list = []
+  const seed = officialSeed(subject)
+  if (seed !== undefined) {
+    list.push({ kind: 'page', url: seed.url, page: seed.url, title: seed.title, engine: 'page:official', score: 100, tier: 'trusted' })
+  }
+  const hunt = await loadImageHunt()
+  if (hunt === undefined) return list
+
+  let results
+  try {
+    /* Sixteen per engine. image-hunt always pulls a full page (≥ 40) and only
+       trims afterwards, so this costs nothing — and eight was too few: for
+       "Dynamax Blissey" Bing's first eight were all YouTube, one site, which
+       the two-site rule then rightly refused to believe. */
+    results = await pooledSearch(hunt, query, { ...opts, limit: opts.limit ?? 16 })
+  } catch {
+    return list
+  }
+  if (process.env.ASYNC_UI_DEBUG === '1') {
+    console.error('[resolver] query=%o engine=%o sources=%o results=%d', query, opts.engine, opts.sources, results.length)
+    for (const item of results.slice(0, 4)) {
+      console.error('   - title=%o page=%o size=%sx%s', item.title, item.page, item.width, item.height)
+    }
+  }
+
+  const pictures = rankCandidates(results, profile).map(({ item, score, tier }) => {
+    const url = item.full || item.thumb
+    return {
+      url,
+      thumb: typeof item.thumb === 'string' && item.thumb !== url && /^https?:\/\//i.test(item.thumb) ? item.thumb : undefined,
+      referer: typeof item.referer === 'string' && item.referer !== '' ? item.referer : undefined,
+      title: String(item.title ?? ''),
+      page: String(item.page ?? ''),
+      engine: String(item.engine ?? ''),
+      score,
+      tier,
+    }
+  })
+  list.push(...pictures.filter(candidate => candidate.tier === 'trusted'))
+  /* The engines also tell us which page each picture was taken from. That
+     page's own lead image is checkable — the picture and its source are one
+     object — but on database and guide sites it is often a templated share
+     card ("Zamazenta (Crowned Shield) · RotomLabs"), so it ranks after the
+     pictures a trusted page actually shows, and before untrusted ones. */
+  const pageHit = bestPage(results, profile)
+  if (pageHit !== undefined) {
+    list.push({ kind: 'page', url: pageHit.url, page: pageHit.url, title: pageHit.title, engine: 'page:og', score: pageHit.score, tier: 'trusted' })
+  }
+  list.push(...pictures.filter(candidate => candidate.tier !== 'trusted'))
+  const seen = new Set()
+  return list.filter((candidate) => {
+    if (seen.has(candidate.url)) return false
+    seen.add(candidate.url)
+    return true
+  }).slice(0, opts.max ?? MAX_CANDIDATES)
+}
+
+/**
+ * The best verified candidate as a direct picture URL, or undefined. Kept for
+ * callers that only want one picture (`/img-resolve`, older async-ui builds).
+ */
+export async function resolveImageCandidate(query, width = DEFAULT_WIDTH, opts = {}) {
+  for (const candidate of await resolveImageCandidates(query, width, opts)) {
+    if (candidate.kind !== 'page') return candidate
+    const image = await pageLeadImage(candidate.page)
+    if (image !== undefined) return { ...candidate, kind: undefined, url: image }
+  }
+  return undefined
+}
+
+/* ---------------- 页面绑定：先定页面，再取该页主图 ---------------- */
+/*
+ * A search hit is "a picture that appears somewhere in a page named like the
+ * query"; a page's lead image is "the picture that page chose to represent
+ * itself". The second one is what a citation-style answer needs: the picture
+ * and its source are the same object, so a wrong picture is visibly a wrong
+ * page instead of an invisible mis-match.
+ */
+
+const PAGE_FETCH_TIMEOUT_MS = 7000
+const PAGE_HTML_LIMIT = 600 * 1024
+const SERP_TIMEOUT_MS = 5500
+const BROWSER_UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+const CJK_TEXT = /[\u3400-\u9fff\uf900-\ufaff]/
+
+const OFFICIAL_PAGE_SEEDS = [
+  {
+    subjects: ['grand theft auto vi', 'grand theft auto 6', 'gta vi', 'gta 6'],
+    url: 'https://www.rockstargames.com/VI',
+    title: 'Grand Theft Auto VI - Rockstar Games',
+  },
+]
+
+function unescapeHtml(text) {
+  return text
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number.parseInt(dec, 10)))
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+}
+
+/** Fetch an HTML document with a browser-ish identity and a hard ceiling. */
+async function fetchPage(url, timeout) {
+  try {
+    const response = await fetch(url, {
+      redirect: 'follow',
+      signal: AbortSignal.timeout(timeout),
+      headers: {
+        'user-agent': BROWSER_UA,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      },
+    })
+    if (!response.ok) return undefined
+    const type = response.headers.get('content-type') ?? ''
+    if (!/html/i.test(type)) return undefined
+    const text = await response.text()
+    return text.slice(0, PAGE_HTML_LIMIT)
+  } catch {
+    return undefined
+  }
+}
+
+/** The image a page declares about itself, in the order a crawler trusts it. */
+function metaImage(html, pageUrl) {
+  const patterns = [
+    /<meta[^>]+property=["']og:image:secure_url["'][^>]*content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image:secure_url["']/i,
+    /<meta[^>]+property=["']og:image["'][^>]*content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]*property=["']og:image["']/i,
+    /<meta[^>]+name=["']twitter:image(?::src)?["'][^>]*content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]*name=["']twitter:image(?::src)?["']/i,
+    /<link[^>]+rel=["']image_src["'][^>]*href=["']([^"']+)["']/i,
+  ]
+  for (const pattern of patterns) {
+    const match = pattern.exec(html)
+    if (match === null) continue
+    const raw = unescapeHtml(match[1]).trim()
+    if (raw === '' || raw.startsWith('data:')) continue
+    try {
+      return new URL(raw, pageUrl).href
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
+
+
+/** The official page for a subject, when there is one. */
+function officialSeed(subject) {
+  const normalized = normalizeMatchText(subject).replace(/\s+/g, ' ').trim()
+  return OFFICIAL_PAGE_SEEDS.find(item => item.subjects.includes(normalized))
+}
+
+/* Lead images do not change between two pictures of one answer, and every
+   search stage may name the same page again. */
+const leadCache = new Map()
+
+/**
+ * The picture a page declares about itself (og:image and friends), or
+ * undefined. Successful lookups are cached for CACHE_TTL_MS.
+ */
+export async function pageLeadImage(pageUrl) {
+  if (typeof pageUrl !== 'string' || !/^https?:\/\//i.test(pageUrl)) return undefined
+  const hit = leadCache.get(pageUrl)
+  if (hit !== undefined && Date.now() - hit.at < CACHE_TTL_MS) return hit.image
+  const html = await fetchPage(pageUrl, PAGE_BIND_TIMEOUT_MS)
+  const image = html === undefined ? undefined : metaImage(html, pageUrl)
+  if (image === undefined) return undefined
+  if (leadCache.size >= CACHE_MAX) leadCache.delete(leadCache.keys().next().value)
+  leadCache.set(pageUrl, { image, at: Date.now() })
+  return image
+}
+
+async function officialSeedImage(subject) {
+  const seed = officialSeed(subject)
+  if (seed === undefined) return undefined
+  const image = await pageLeadImage(seed.url)
+  if (image === undefined) return undefined
+  return { url: image, title: seed.title, page: seed.url, engine: 'page:official', score: 100, tier: 'trusted' }
+}
+
+/** Bing wraps organic links in /ck/a?...&u=a1<base64url>. */
+function decodeBingHref(href) {
+  if (!/bing\.com\/ck\/a/i.test(href)) return href
+  const match = /[?&]u=a1([^&"']+)/.exec(href)
+  if (match === null) return undefined
+  try {
+    const raw = match[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = raw + '='.repeat((4 - (raw.length % 4)) % 4)
+    return Buffer.from(padded, 'base64').toString('utf8')
+  } catch {
+    return undefined
+  }
+}
+
+async function serpHits(query) {
+  const lang = CJK_TEXT.test(query) ? 'zh' : 'en'
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=${lang}&count=10`
+  const html = await fetchPage(url, SERP_TIMEOUT_MS)
+  if (html === undefined) return []
+  const hits = []
+  const seen = new Set()
+  const re = /<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g
+  let match
+  while ((match = re.exec(html)) !== null) {
+    const href = decodeBingHref(unescapeHtml(match[1]))
+    if (typeof href !== 'string' || !/^https?:\/\//i.test(href)) continue
+    const host = hostOf(href)
+    if (host === '' || /(^|\.)(bing|microsoft|msn)\.com$/i.test(host)) continue
+    if (seen.has(href)) continue
+    seen.add(href)
+    const title = unescapeHtml(match[2].replace(/<[^>]+>/g, '')).trim()
+    if (title === '') continue
+    hits.push({ url: href, title })
+  }
+  return hits.slice(0, 8)
+}
+
+/**
+ * Score a page the same way a search hit is scored: title first, then URL.
+ *
+ * The longest token is the subject ("Houndoom" out of "Mega Houndoom pokemon")
+ * and must be present. Without that rule "Mega Houndoom pokemon" happily lands
+ * on https://mega.nz/login because one generic word matched — exactly the noise
+ * a page-bound picture is supposed to remove.
+ */
+function pageScore(hit, tokens, rank, profile) {
+  /* The Zamazenta article leads with the Hero form; "Crowned Shield Zamazenta"
+     must not borrow it. Same sibling veto as image hits. */
+  if (profile !== undefined && identityConflict({ title: hit.title, page: urlText(hit.url) }, profile)) return undefined
+  const title = normalizeMatchText(hit.title)
+  const path = normalizeMatchText(urlText(hit.url))
+  const matched = tokens.filter((token) => containsBounded(title, token) || containsBounded(path, token))
+  const titleMatched = tokens.filter((token) => containsBounded(title, token))
+  const coverage = tokens.length === 0 ? 0 : matched.length / tokens.length
+
+  /* A page's Open Graph image is not automatically the page's subject: SEO
+     spam pages often copy an exact query into their title but advertise an
+     unrelated poster. Only page-bind from known editorial/official sources,
+     and require the page title itself to identify the requested subject. */
+  if (!TRUSTED_HOSTS.test(hostOf(hit.url))) return undefined
+  if (coverage < 0.85 || titleMatched.length / tokens.length < 0.75) return undefined
+
+  let score = coverage * 8 + (titleMatched.length / tokens.length) * 4
+    + matched.length * 2 + Math.max(0, 2 - rank * 0.4)
+  score += 4
+  return score
+}
+
+/** Wikipedia's own "which picture represents this article" API. */
+async function wikiLead(query, lang) {
+  const params = new URLSearchParams({
+    action: 'query', format: 'json', generator: 'search', gsrsearch: query, gsrlimit: '4',
+    prop: 'pageimages', piprop: 'original|thumbnail', pithumbsize: '1400',
+  })
+  try {
+    const response = await fetch(`https://${lang}.wikipedia.org/w/api.php?${params}`, {
+      signal: AbortSignal.timeout(SERP_TIMEOUT_MS),
+      headers: { 'user-agent': USER_AGENT },
+    })
+    if (!response.ok) return undefined
+    const data = await response.json()
+    const pages = Object.values(data?.query?.pages ?? {})
+    const profile = subjectProfile(query)
+    const tokens = profile.tokens
+    let best
+    for (const page of pages) {
+      const original = page?.original?.source
+      const thumb = page?.thumbnail?.source
+      const url = typeof original === 'string' ? original : typeof thumb === 'string' ? thumb : undefined
+      if (url === undefined) continue
+      const title = String(page.title ?? '')
+      const score = pageScore({ title, url: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title)}` }, tokens, Number(page.index ?? 1) - 1, profile)
+      if (score === undefined) continue
+      if (best === undefined || score > best.score) {
+        best = {
+          url,
+          title,
+          page: `https://${lang}.wikipedia.org/wiki/${encodeURIComponent(title)}`,
+          engine: `page:wiki-${lang}`,
+          score,
+        }
+      }
+    }
+    return best
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Resolve a query to the lead image of the page that names that subject.
+ *
+ * @returns `{ url, title, page, engine, score }`, or undefined when no page
+ * clears the title match — the caller then falls back to plain image search.
+ */
+export async function resolvePageImage(query, opts = {}) {
+  const text = String(query ?? '').trim()
+  const subject = String(opts.subject ?? text).trim()
+  if (text === '' || text.length > MAX_QUERY || subject === '' || subject.length > MAX_QUERY) return undefined
+  const official = await officialSeedImage(subject)
+  if (official !== undefined) return official
+
+  const lang = CJK_TEXT.test(subject) ? 'zh' : 'en'
+  const wiki = await wikiLead(subject, lang)
+  if (wiki !== undefined) return wiki
+  const profile = subjectProfile(subject, text)
+  const tokens = profile.tokens
+  if (tokens.length === 0) return undefined
+  /* Search with the fuller query, but validate the page against the exact
+     canonical subject. Search modifiers must never broaden the identity test. */
+  const hits = await serpHits(text)
+  if (hits.length === 0) return undefined
+  const ranked = []
+  for (let rank = 0; rank < hits.length; rank += 1) {
+    const score = pageScore(hits[rank], tokens, rank, profile)
+    if (score === undefined) continue
+    ranked.push({ ...hits[rank], score })
+  }
+  ranked.sort((a, b) => b.score - a.score)
+  /* Lead images are declared in <head>, so three pages in sequence is cheap
+     enough (each fetch is short-circuited on the first success). */
+  for (const hit of ranked.slice(0, opts.pages ?? 3)) {
+    const html = await fetchPage(hit.url, PAGE_FETCH_TIMEOUT_MS)
+    if (html === undefined) continue
+    const image = metaImage(html, hit.url)
+    if (image === undefined) continue
+    return { url: image, title: hit.title, page: hit.url, engine: 'page:og', score: hit.score }
+  }
+  return undefined
+}
+
+/** The best-scoring source page among image results, if one is convincing. */
+function bestPage(results, profile) {
+  const seen = new Set()
+  let best
+  for (let rank = 0; rank < results.length; rank += 1) {
+    const item = results[rank]
+    const page = typeof item.page === 'string' ? item.page : ''
+    if (!/^https?:\/\//i.test(page) || seen.has(page)) continue
+    seen.add(page)
+    const score = pageScore({ title: String(item.title ?? ''), url: page }, profile.tokens, rank, profile)
+    if (score === undefined || score < 6) continue
+    if (best === undefined || score > best.score) {
+      best = { url: page, title: String(item.title ?? ''), score }
+    }
+  }
+  return best
+}
+
+/* ---------------- 内置 Wikimedia 兜底 ---------------- */
+
+function searchTerms(query) {
+  const tokens = query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  if (tokens.length <= 3) return [tokens.join(' ')]
+  return [...new Set([
+    tokens.join(' '),
+    tokens.slice(-3).join(' '),
+    tokens.slice(0, 3).join(' '),
+    tokens.slice(-2).join(' '),
+  ])]
+}
+
+function pickPage(pages, tokens, requireHit) {
+  const tail = tokens.slice(-2)
+  const scored = []
+  for (const page of pages) {
+    const info = page?.imageinfo?.[0]
+    if (typeof info?.thumburl !== 'string' || !IMAGE_MIME.test(info.mime ?? '')) continue
+    const title = String(page.title ?? '').toLowerCase()
+    const tailScore = tail.reduce((sum, token) => sum + (title.includes(token) ? 1 : 0), 0)
+    const anyScore = tokens.reduce((sum, token) => sum + (token.length >= 4 && title.includes(token) ? 1 : 0), 0)
+    const subjectHit = tail.some((token) => token.length >= 3 && title.includes(token))
+    if (requireHit && (!subjectHit || anyScore === 0)) continue
+    scored.push({ url: info.thumburl.split('?')[0], score: tailScore * 10 + anyScore })
+  }
+  scored.sort((a, b) => b.score - a.score)
+  return scored[0]?.url
+}
+
+async function wikimediaOnce(terms, width, deadline, tokens, requireHit) {
+  const params = new URLSearchParams({
+    action: 'query',
+    format: 'json',
+    generator: 'search',
+    gsrsearch: `filetype:bitmap ${terms}`,
+    gsrnamespace: '6',
+    gsrlimit: '6',
+    prop: 'imageinfo',
+    iiprop: 'url|mime',
+    iiurlwidth: String(width),
+  })
+  const budget = deadline - Date.now()
+  if (budget <= 0) return undefined
+  const response = await fetch(`${UPSTREAM}?${params}`, {
+    headers: { 'user-agent': USER_AGENT, accept: 'application/json' },
+    signal: AbortSignal.timeout(Math.min(4000, budget)),
+  })
+  if (!response.ok) return undefined
+  const body = await response.json()
+  return pickPage(Object.values(body?.query?.pages ?? {}), tokens, requireHit)
+}
+
+async function wikimediaSearch(query, width, deadline) {
+  const tokens = query.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  for (const terms of searchTerms(query)) {
+    const requireHit = terms !== tokens.join(' ')
+    let found
+    try {
+      found = await wikimediaOnce(terms, width, deadline, tokens, requireHit)
+    } catch {
+      found = undefined
+    }
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/* ---------------- 对外：描述 → 图片 URL ---------------- */
+
+/**
+ * 用一段自然语言描述换一张图片 URL。
+ * @param {string} query 画面描述
+ * @param {number} [width] 期望宽度
+ * @param {{ engine?: string, sources?: string[], minPixels?: number }} [opts]
+ * @returns {Promise<string | undefined>}
+ */
+export async function resolveImageUrl(query, width = DEFAULT_WIDTH, opts = {}) {
+  const text = String(query ?? '').trim()
+  const subject = String(opts.subject ?? text).trim()
+  if (text === '' || subject === '' || text.length > MAX_QUERY || subject.length > MAX_QUERY) return undefined
+  const key = `${width}|${opts.engine ?? ''}|${opts.sources?.join(',') ?? ''}|${subject}|${text}`
+  const cached = cacheGet(key)
+  if (cached !== undefined) return cached
+
+  /* This route is used inside reader-facing answers: an unverified first hit
+     is worse than no image. All callers therefore use the same subject-aware
+     candidate validator; there is no permissive default mode. */
+  const candidate = await resolveImageCandidate(text, width, { ...opts, subject })
+  if (candidate === undefined) return undefined
+  cacheSet(key, candidate.url)
+  return candidate.url
+}
+
+function clampWidth(raw) {
+  const value = Number.parseInt(raw ?? '', 10)
+  if (!Number.isFinite(value)) return DEFAULT_WIDTH
+  return Math.min(MAX_WIDTH, Math.max(120, value))
+}
+
+/**
+ * webServer 前缀路由的处理器。
+ * GET /img-resolve?q=…[&w=900][&engine=cc|baidu|duitang|…][&debug=1]
+ */
+export async function serveImageResolve(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, { allow: 'GET, HEAD' })
+    res.end()
+    return
+  }
+
+  let parsed
+  try {
+    parsed = new URL(req.url ?? '/', 'http://local')
+  } catch {
+    res.writeHead(400)
+    res.end()
+    return
+  }
+
+  const query = (parsed.searchParams.get('q') ?? '').trim().slice(0, MAX_QUERY)
+  const subject = (parsed.searchParams.get('s') ?? parsed.searchParams.get('subject') ?? query).trim().slice(0, MAX_QUERY)
+  const width = clampWidth(parsed.searchParams.get('w'))
+  const engine = parsed.searchParams.get('engine') ?? parsed.searchParams.get('src') ?? undefined
+  const rawSources = parsed.searchParams.get('sources')
+
+  if (query === '') {
+    res.writeHead(400, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end('missing ?q= (image description)')
+    return
+  }
+
+  let url
+  try {
+    url = await resolveImageUrl(query, width, {
+      subject,
+      engine: engine ?? undefined,
+      sources: rawSources === null ? undefined : rawSources.split(',').map((s) => s.trim()).filter(Boolean),
+    })
+  } catch {
+    url = undefined
+  }
+
+  if (url === undefined) {
+    res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(`no image found for: ${query}`)
+    return
+  }
+
+  if (parsed.searchParams.get('debug') === '1') {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(JSON.stringify({ query, width, engine: engine ?? null, url }, null, 2))
+    return
+  }
+
+  res.writeHead(302, {
+    location: url,
+    'cache-control': 'public, max-age=300',
+    'x-image-resolver': 'dsh-image-hunt',
+  })
+  res.end()
+}
+
+/** Cordis 插件入口。 */
+export function apply(ctx) {
+  ctx.inject(['webServer'], (webCtx) => {
+    const webServer = webCtx.reflect.get('webServer')
+    if (webServer === undefined || typeof webServer.register !== 'function') return
+    webCtx.effect(
+      () => webServer.register({ kind: 'prefix', path: ROUTE_PATH, handler: serveImageResolve }),
+      'dsh-image-resolver: /img-resolve route',
+    )
+  })
+}

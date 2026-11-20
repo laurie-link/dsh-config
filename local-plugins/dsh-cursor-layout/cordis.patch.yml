@@ -1,0 +1,9 @@
+# dsh-cursor-layout bundle patch: mount the plugin row.
+#
+# The row's `name` is both the Host half's Node import specifier (resolved from
+# the profile's node_modules) and the key `dsh-client-modules` uses to scan the
+# browser half (through the package `exports["./client"]`), so one row mounts
+# both halves.
+- insert:
+    - id: cursor-layout
+      name: 'dsh-cursor-layout'

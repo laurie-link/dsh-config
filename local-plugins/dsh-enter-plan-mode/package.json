@@ -1,0 +1,26 @@
+{
+  "name": "dsh-enter-plan-mode",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gives the agent a judge-and-switch entry into plan mode (Claude Code style EnterPlanMode): it can decide a task deserves a plan, while leaving plan mode still needs the user's approval through exit_plan_mode.",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "locale",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

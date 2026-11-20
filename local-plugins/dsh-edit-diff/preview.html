@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>dsh-edit-diff preview</title>
+<style>
+  html, body { margin: 0; background: #1b1c1f; color: #e6e6e6; font: 14px/1.5 -apple-system, "PingFang SC", sans-serif; }
+  #root { max-width: 720px; margin: 32px auto; padding: 0 24px; display: flex; flex-direction: column; gap: 18px; }
+  .label { color: #8b8f96; font-size: 12px; margin: 0 0 6px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ---- 极简 React 渲染器：函数组件 + useState/useEffect/useMemo（按路径保存 hook 状态）----
+const React = {
+  Fragment: Symbol('Fragment'),
+  createElement(type, props, ...children) {
+    const flat = []
+    for (const child of children) {
+      if (Array.isArray(child)) flat.push(...child.flat(4))
+      else flat.push(child)
+    }
+    const next = Object.assign({}, props || {})
+    if (flat.length) next.children = flat
+    return { type, props: next }
+  },
+}
+
+const hookStores = new Map()
+let hookPath = ''
+let hookIndex = 0
+let pending = false
+let rootRender = null
+
+function scheduleRender() {
+  if (pending) return
+  pending = true
+  Promise.resolve().then(() => { pending = false; if (rootRender) rootRender() })
+}
+
+function useState(initial) {
+  const key = hookPath + '#' + hookIndex++
+  const store = hookStores
+  if (!store.has(key)) store.set(key, typeof initial === 'function' ? initial() : initial)
+  const set = (value) => {
+    const prev = store.get(key)
+    const next = typeof value === 'function' ? value(prev) : value
+    if (Object.is(prev, next)) return
+    store.set(key, next)
+    scheduleRender()
+  }
+  return [store.get(key), set]
+}
+
+function useMemo(fn) { hookIndex++; return fn() }
+
+function useEffect(effect, deps) {
+  const key = hookPath + '@effect' + hookIndex++
+  const store = hookStores
+  const prev = store.get(key)
+  const same = Array.isArray(deps) && prev !== undefined &&
+    Array.isArray(prev.deps) && deps.length === prev.deps.length &&
+    deps.every((value, i) => Object.is(value, prev.deps[i]))
+  if (same) return
+  store.set(key, { deps })
+  const cleanup = effect()
+  if (typeof cleanup === 'function') store.set(key + '@cleanup', cleanup)
+}
+
+const ReactHooks = { useState, useEffect, useMemo, useRef: (v) => ({ current: v }), useCallback: (fn) => fn, useContext: () => ({}) }
+
+function renderNode(node, parent, path) {
+  if (node === null || node === undefined || node === false || node === true) return
+  if (typeof node === 'string' || typeof node === 'number') { parent.appendChild(document.createTextNode(String(node))); return }
+  if (Array.isArray(node)) { node.forEach((child, i) => renderNode(child, parent, path + '.' + i)); return }
+  if (typeof node.type === 'function') {
+    const prevPath = hookPath, prevIndex = hookIndex
+    hookPath = path
+    hookIndex = 0
+    let out
+    try { out = node.type(node.props) } finally { hookPath = prevPath; hookIndex = prevIndex }
+    renderNode(out, parent, path + '>')
+    return
+  }
+  if (node.type === React.Fragment) { renderNode(node.props.children, parent, path + '+'); return }
+  if (typeof node.type === 'string') {
+    const el = document.createElement(node.type)
+    for (const [key, value] of Object.entries(node.props || {})) {
+      if (key === 'children') continue
+      if (key === 'className') el.setAttribute('class', value)
+      else if (key === 'style' && value && typeof value === 'object') Object.assign(el.style, value)
+      else if (key.startsWith('on') && typeof value === 'function') el.addEventListener(key.slice(2).toLowerCase(), value)
+      else if (value === true) el.setAttribute(key, '')
+      else if (value !== false && value !== null && value !== undefined) el.setAttribute(key, String(value))
+    }
+    renderNode(node.props.children, el, path + '/' + node.type)
+    parent.appendChild(el)
+  }
+}
+</script>
+<script>
+window.__errs = []
+window.addEventListener('error', (e) => { window.__errs.push(String(e.message)) })
+</script>
+<script>
+// ---- 假模块系统 ----
+let captured = null
+window.__ModuleLoader__ = { load(def) { captured = def } }
+const FILE_TEXT = [
+  '---',
+  'name: pokeep-article-optimization',
+  'description: 写 PoKeep 文章时使用。',
+  '---',
+  '',
+  '# PoKeep 文章写作规范',
+  '',
+  '## 开头',
+  '',
+  '- 第一段直接回答读者的问题。',
+  '- 句子须有标点（中文/日文用 `。`，英文用 `.`）。',
+  '- 英文大小写统一（单条评论内）。',
+  '- 英文每句句首必须大写，句末用句号。',
+  '- 英文用户名避免千篇一律的 `name_x` 格式。',
+  '',
+  '## 结尾',
+  '',
+  '- 不要写总结段。',
+].join('\n')
+window.__calls = []
+window.fetch = (url) => {
+  window.__calls.push(String(url))
+  if (String(url).startsWith('/edit-diff/file')) {
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true, text: FILE_TEXT }) })
+  }
+  return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) })
+}
+</script>
+<script src="client.js"></script>
+<script>
+const mod = captured.factory((id) => {
+  if (id === 'react') return Object.assign({}, React, ReactHooks)
+  throw new Error('unexpected require ' + id)
+})
+
+let Component = null
+const ctx = {
+  effect(fn) { const d = fn(); return typeof d === 'function' ? d : () => {} },
+  slots: {
+    inject(name, factory) {
+      const it = factory()
+      const disposers = typeof it === 'function' ? [it] : Array.from(it)
+      return () => { for (const d of disposers) if (typeof d === 'function') d() }
+    },
+    register(options, component) { if (options.key === 'edit') Component = component; return () => {} },
+  },
+}
+mod.apply(ctx)
+
+function partialArgs(source) {
+  const keys = Object.keys(source)
+  return {
+    keys: () => keys,
+    has: (k) => k in source,
+    complete: () => true,
+    stringLength: (k) => (typeof source[k] === 'string' ? source[k].length : 0),
+    text: (k) => (typeof source[k] === 'string' ? source[k] : ''),
+    value: (k) => source[k],
+  }
+}
+
+const editArgs = {
+  file_path: '/Users/laruielaurence/.dsh/skills/pokeep-article-optimization/SKILL.md',
+  old_string: '- 英文大小写统一（单条评论内）。',
+  new_string: '- **英文每句句首必须大写**，句末用句号。',
+}
+
+function resultBlock(args, diffs) {
+  return {
+    kind: 'tool-result',
+    name: 'edit',
+    call: { name: 'edit', argsRaw: JSON.stringify(args) },
+    args: partialArgs(args),
+    content: [{ type: 'text', text: 'ok' }],
+    isError: false,
+    meta: { path: args.file_path, diffs },
+    subCalls: [],
+  }
+}
+
+const diffs = [{
+  path: editArgs.file_path,
+  oldText: '## 开头\n\n- 第一段直接回答读者的问题。\n- 句子须有标点（中文/日文用 `。`，英文用 `.`）。\n- 英文大小写统一（单条评论内）。\n- 英文用户名避免千篇一律的 `name_x` 格式。',
+  newText: '## 开头\n\n- 第一段直接回答读者的问题。\n- 句子须有标点（中文/日文用 `。`，英文用 `.`）。\n- **英文每句句首必须大写**，句末用句号。\n- 英文用户名避免千篇一律的 `name_x` 格式。',
+}]
+
+const samples = [
+  ['运行中（参数已在流式输出）', { phase: 'start', block: { name: 'edit', args: partialArgs({ file_path: editArgs.file_path, old_string: editArgs.old_string, new_string: editArgs.new_string }), isError: false, content: [] } }],
+  ['已完成（带行号 + 展开）', { phase: 'result', block: resultBlock(editArgs, diffs) }],
+]
+
+rootRender = () => {
+  const root = document.getElementById('root')
+  root.innerHTML = ''
+  for (const [label, props] of samples) {
+    const wrap = document.createElement('div')
+    const h = document.createElement('p')
+    h.className = 'label'
+    h.textContent = label
+    wrap.appendChild(h)
+    const host = document.createElement('div')
+    wrap.appendChild(host)
+    root.appendChild(wrap)
+    renderNode({ type: Component, props: Object.assign({ useDisclosure: () => ({ open: false, toggle() {} }), callId: 'c1', toolName: 'edit', cwd: '/Users/laruielaurence', home: '/Users/laruielaurence', openFile() {}, loadImage: () => Promise.resolve(null) }, props) }, host, 'sample' + samples.indexOf(samples.find((row) => row[0] === label)))
+  }
+}
+rootRender()
+</script>
+</body>
+</html>

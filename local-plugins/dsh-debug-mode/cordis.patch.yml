@@ -1,0 +1,4 @@
+# dsh-debug-mode bundle patch: mount the host plugin row.
+- insert:
+    - id: dsh-debug-mode
+      name: 'dsh-debug-mode'

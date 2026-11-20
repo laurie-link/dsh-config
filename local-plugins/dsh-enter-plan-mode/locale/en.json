@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Enter plan mode",
+    "description": "Lets the agent switch a session into plan mode on its own judgement; leaving still needs the user's approval."
+  }
+}

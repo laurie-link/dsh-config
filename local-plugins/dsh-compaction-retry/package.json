@@ -1,0 +1,32 @@
+{
+  "name": "dsh-compaction-retry",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Retries DSH session-compaction summarization requests with a provider-style retry policy (mode / maxRetries / retryableCodes / backoff), mirroring @deepseek-ai/dsh-llm-retry, via the compaction/summary-error waterfall. Prevents transient upstream 429/5xx from failing automatic compaction or a model switch with MODEL_SWITCH_COMPACTION_FAILED. The client half shows a Codex-style \"正在压缩上下文…\" row above the composer (with retry and pre-model-switch detail) fed by the host's /compaction-retry/status route.",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

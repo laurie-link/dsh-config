@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>async-ui map: expand list</title>
+<style>
+  body { font: 14px system-ui; padding: 20px; background: #1b1d21; color: #eee; }
+  .case { transform: translateZ(0); border: 1px solid #333; border-radius: 12px; padding: 10px; width: 520px; }
+  section[data-genui] { display: block; }
+  .maplibregl-map { height: 200px; background: linear-gradient(135deg, #2b4a6f, #1f2f45); border-radius: 8px; }
+  ul { list-style: none; padding: 0; margin: 8px 0 0; }
+  li { display: flex; gap: 8px; align-items: center; padding: 4px 0; }
+  li > button { flex: 1; text-align: left; }
+</style>
+<div class="case">
+  <section data-genui>
+    <div role="region" class="maplibregl-map"></div>
+    <ul>
+      <li><button>和平饭店<span>31.2411, 121.4846</span></button><span class="copy">复制坐标</span></li>
+      <li><button>外滩观景平台<span>31.2353, 121.4876</span></button><span class="copy">复制坐标</span></li>
+      <li><button>东方明珠<span>31.2419, 121.4953</span></button><span class="copy">复制坐标</span></li>
+    </ul>
+    <div><button>放大</button><button>缩小</button><button>重置视图</button><button>清除选择</button></div>
+  </section>
+</div>
+<script>
+  window.__ModuleLoader__ = {
+    load(spec) {
+      const api = spec.factory(function () { return { async: () => Promise.reject(new Error('nope')) } })
+      api.apply({ effect: (fn) => fn() })
+    },
+  }
+  window.__picked = 0
+  window.__reset = 0
+  document.querySelectorAll('li > button').forEach(b => b.addEventListener('click', () => { window.__picked += 1 }))
+  document.querySelectorAll('section button').forEach(b => {
+    if (b.textContent === '重置视图') b.addEventListener('click', () => { window.__reset += 1 })
+  })
+</script>
+<script src="../client.js?v=list1"></script>

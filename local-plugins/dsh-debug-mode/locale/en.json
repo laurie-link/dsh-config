@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Debug mode",
+    "description": "Cursor-style /debug session: instrument the code with runtime logs, collect them on a local endpoint, fix the root cause, then verify no instrumentation is left behind."
+  }
+}

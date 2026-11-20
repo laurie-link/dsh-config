@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Interface control",
+    "description": "Lets the agent switch the IDE and Agent projections, show or hide the right sidebar, and open a page or file in it."
+  }
+}

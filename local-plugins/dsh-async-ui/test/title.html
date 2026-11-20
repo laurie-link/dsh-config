@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8">
+<title>async-ui gallery-title harness</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:28px; font:15px/1.6 -apple-system,"PingFang SC",sans-serif;
+         background:#0f1115; color:#e6e8ee; }
+  .case { max-width:640px; margin:0 auto 22px; background:#171a21; border:1px solid #262b36;
+          border-radius:14px; padding:18px; }
+  .case > .name { font-size:12px; color:#7d879a; margin-bottom:10px; }
+  .case h3 { margin:0 0 10px; font-size:15px; font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .grid img { display:block; width:100%; aspect-ratio:1/1; object-fit:cover; border-radius:10px; background:#2a2f3a; }
+</style></head>
+<body>
+  <!-- Case A: what GenUI actually renders when the spec has no title -->
+  <div class="case">
+    <div class="name">A · GenUI 的默认标题（应被隐藏）</div>
+    <div data-genui>
+      <section aria-labelledby="g1-title">
+        <h3 id="g1-title">图片组</h3>
+        <div class="grid">
+          <img src="http://127.0.0.1:55786/async-ui-img?q=Mega%20Houndoom%20pokemon&w=900&fit=square&size=200" alt="">
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Case B: an explicit title must survive -->
+  <div class="case">
+    <div class="name">B · 显式 title（应保留）</div>
+    <div data-genui>
+      <section aria-labelledby="g2-title">
+        <h3 id="g2-title">啤酒 · 三种</h3>
+        <div class="grid">
+          <img src="http://127.0.0.1:55786/async-ui-img?q=craft%20beer%20glass&w=900&fit=square&size=200" alt="">
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Case C: English locale default label -->
+  <div class="case">
+    <div class="name">C · 英文 locale 默认标题（应被隐藏）</div>
+    <div data-genui>
+      <section aria-labelledby="g3-title">
+        <h3 id="g3-title">Image gallery</h3>
+        <div class="grid">
+          <img src="http://127.0.0.1:55786/async-ui-img?q=kyoto%20temple%20night&w=900&fit=square&size=200" alt="">
+        </div>
+      </section>
+    </div>
+  </div>
+
+<script>
+  // The tiny __ModuleLoader__ the real host provides; here it just runs the
+  // module and calls apply() once, with an effect() that runs immediately.
+  window.__ModuleLoader__ = {
+    load({ id, factory }) {
+      window.__pluginId = id
+      const mod = factory()
+      mod.apply({ effect(fn) { window.__dispose = fn() } })
+    },
+  }
+  window.__result = () => [...document.querySelectorAll('[data-genui] h3')].map(h => ({
+    id: h.id,
+    text: h.textContent.trim(),
+    hidden: h.hasAttribute('data-async-ui-hide'),
+    display: getComputedStyle(h).display,
+  }))
+</script>
+<script src="../client.js?v=1"></script>
+</body></html>

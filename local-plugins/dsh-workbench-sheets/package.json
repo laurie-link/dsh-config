@@ -1,0 +1,38 @@
+{
+  "name": "dsh-workbench-sheets",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Editable CSV/TSV/XLSX workbook tabs for the DSH right-hand workbench (registered as official sidebar tab types), with local read/save of the original file.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "lib",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check index.js && node --check client.js && node --check lib/*.js",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "dependencies": {
+    "exceljs": "4.4.0"
+  }
+}

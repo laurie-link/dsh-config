@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH GenUI AsyncImage regression</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; padding:28px; background:#101319; color:#eef1f6;
+         font:15px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif; }
+  .genui-card { max-width:920px; margin:0 auto; padding:22px; border:1px solid #303744;
+                border-radius:18px; background:#191e27; }
+  h2 { margin:0 0 8px; font-size:19px; }
+  .intro { margin:0 0 20px; color:#aab4c3; }
+  [data-genui] .genui-gallery { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+  figure { margin:0; min-width:0; }
+  figure img { display:block; width:100%; max-height:360px; object-fit:contain; border-radius:12px; background:#252c38; }
+  figcaption { padding:8px 2px 0; color:#b8c2d1; font-size:13px; }
+  .status { margin-top:18px; color:#91c7a6; font-size:12px; white-space:pre-wrap; }
+  @media(max-width:620px) { [data-genui] .genui-gallery { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<section class="genui-card" data-genui>
+  <h2>Visual regression: four distinct subjects</h2>
+  <p class="intro">The image URLs use separate search queries and canonical subjects. Each tile should show the exact form/entity, load without a broken placeholder, and retain its caption.</p>
+  <div class="genui-gallery">
+    <figure>
+      <img src="/async-img?q=Mega%20Houndoom%20Pokemon%20official%20artwork&s=Mega%20Houndoom&w=900" alt="Mega Houndoom">
+      <figcaption>Mega Houndoom — exact Mega form</figcaption>
+    </figure>
+    <figure>
+      <img src="/async-img?q=Cresselia%20Pokemon%20official%20artwork&s=Cresselia&w=900" alt="Cresselia">
+      <figcaption>Cresselia — correct species</figcaption>
+    </figure>
+    <figure>
+      <img src="/async-img?q=Grand%20Theft%20Auto%20VI%20official%20artwork&s=Grand%20Theft%20Auto%20VI&w=900" alt="Grand Theft Auto VI">
+      <figcaption>Grand Theft Auto VI — not GTA V</figcaption>
+    </figure>
+    <figure>
+      <img src="/async-img?q=%E6%B7%B1%E5%9C%B3%E5%B8%82%E6%B0%91%E4%B8%AD%E5%BF%83%20%E5%BB%BA%E7%AD%91%20%E5%A4%96%E8%A7%82&s=%E6%B7%B1%E5%9C%B3%E5%B8%82%E6%B0%91%E4%B8%AD%E5%BF%83&w=900" alt="深圳市民中心">
+      <figcaption>深圳市民中心 — Chinese proper-name match</figcaption>
+    </figure>
+  </div>
+  <div class="status" id="status">Waiting for image load…</div>
+</section>
+<script>
+  window.__ModuleLoader__ = { load({ id, factory }) {
+    const mod = factory(() => { throw new Error("no require in test harness") });
+    const ctx = { effect(fn) { window.__asyncUiDispose = fn(); } };
+    mod.apply(ctx);
+    window.__asyncUiLoaded = id;
+  }};
+  const update = () => {
+    const imgs = [...document.images];
+    const rows = imgs.map(img => ({
+      alt: img.alt,
+      loaded: img.complete && img.naturalWidth > 0,
+      width: img.naturalWidth,
+      pending: img.hasAttribute("data-async-pending"),
+      source: img.getAttribute("data-async-source") || ""
+    }));
+    document.querySelector("#status").textContent =
+      "client=" + (window.__asyncUiLoaded || "not-loaded") + "\n" +
+      rows.map(r => r.alt + ": loaded=" + r.loaded + ", width=" + r.width + ", pending=" + r.pending + ", source=" + r.source).join("\n");
+  };
+  addEventListener("load", update);
+  new MutationObserver(update).observe(document.documentElement, {subtree:true,attributes:true,attributeFilter:["data-async-pending","data-async-source"]});
+</script>
+<script src="/client.js"></script>
+</body>
+</html>

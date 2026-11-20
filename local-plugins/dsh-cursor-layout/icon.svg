@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Cursor layout">
+  <rect x="4" y="10" width="56" height="44" rx="7" fill="#0f1115" stroke="#3b4048" stroke-width="2"/>
+  <rect x="9" y="15" width="10" height="34" rx="2.5" fill="#1f6feb"/>
+  <rect x="22" y="15" width="22" height="34" rx="2.5" fill="#161b22" stroke="#30363d"/>
+  <path d="M27 23h9M27 28h12M27 33h7M27 38h10" stroke="#8b949e" stroke-width="1.8" stroke-linecap="round"/>
+  <rect x="47" y="15" width="8" height="34" rx="2.5" fill="#8957e5" opacity="0.85"/>
+</svg>

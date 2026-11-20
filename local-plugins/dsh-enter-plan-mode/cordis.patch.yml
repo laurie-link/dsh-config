@@ -1,0 +1,9 @@
+# dsh-enter-plan-mode bundle patch: mount the tool row.
+#
+# The row adds `enter_plan_mode` on top of @deepseek-ai/dsh-plan-mode's
+# `exit_plan_mode`: the model may switch the session into plan mode on its own
+# judgement (Claude Code's EnterPlanMode), but leaving plan mode still goes
+# through the user-reviewed exit tool or the user's own mode switch.
+- insert:
+    - id: enter-plan-mode
+      name: 'dsh-enter-plan-mode'

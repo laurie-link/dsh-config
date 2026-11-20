@@ -1,0 +1,26 @@
+{
+  "name": "dsh-edit-diff",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cursor 式的文件改动卡片：edit / write / apply_patch 直接在对话里展开红绿 diff（带行号），点一下在 IDE 视图打开文件并跳到改动位置。",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}

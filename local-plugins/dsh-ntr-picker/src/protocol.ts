@@ -1,0 +1,1302 @@
+/**
+ * dsh-ntr shared contracts (browser-safe: types only, zero runtime code).
+ *
+ * Two planes:
+ * - `AcpEvent`: host → browser, one JSON frame per `session/update` fold,
+ *   permission round-trip, agent process status, and turn lifecycle.
+ * - RPC payloads: browser → host unary calls on the `/acp` Connection channel.
+ *
+ * Security invariants encoded here (enforced host-side in impl.ts):
+ * - A SESSION never names a program to spawn: `session/start` and the
+ *   conversation↔agent binding only select a configured agent id and a cwd
+ *   that must resolve inside the agent's allowed roots. Naming a program is
+ *   a CONFIGURATION act instead — the browser may do it through `agent/save`
+ *   / `agent/test`, both of which run the command through `validateAgentDef`
+ *   (a command line, not a bare path) and both of which really spawn.
+ * - Agent environment variables flow config → child process only.
+ */
+
+import type { SessionUpdate } from '@agentclientprotocol/sdk'
+
+// ---- Configuration (host side, from the profile layer) ----
+
+/** One pre-configured ACP agent executable. */
+export interface AcpAgentDef {
+  /** Stable id the browser selects by. `^[a-z0-9][a-z0-9._-]*$`. */
+  id: string
+  /** Display name (defaults to the id). */
+  title?: string
+  /**
+   * Executable spawned over stdio, as a full command line (`codebuddy --acp`),
+   * parsed by `validateAgentDef`. The browser MAY set it — that is exactly
+   * what the settings panel's single command box does, through `agent/save`
+   * (persist, then probe) and `agent/test` (spawn a throwaway handshake). A
+   * SESSION never can: `session/start` and the conversation binding only
+   * select a configured agent id (see the module header).
+   */
+  command: string
+  /** Argument vector (no shell interpretation). */
+  args?: string[]
+  /**
+   * npm package installed globally (`npm install -g`) when `command` cannot be
+   * resolved on the host PATH, right before the spawn is attempted. Unset → a
+   * missing command just fails with ENOENT. Name-only charset is enforced by
+   * `validateAgentDef` (no shell metacharacters can ever reach the installer).
+   */
+  npmPackage?: string
+  /** Child environment: the inherited host env, with these keys layered on top. */
+  env?: Record<string, string>
+  /** Default absolute workspace directory for new sessions. */
+  cwd?: string
+  /** Absolute roots a session cwd may resolve under. Defaults to `[cwd]`. */
+  allowedCwdRoots?: string[]
+  /**
+   * Which probed `category: model` choices this agent offers as `agentId@choice`
+   * variants in the plugin's own ACP seats (the chips/picker in the chat
+   * composer and the ACP-mode model seat). Those menus have no search, so the
+   * full catalog is a list storm nobody can navigate: a real pi agent publishes
+   * 500 choices, omp 581. Variants are **opt-in** — unset or empty offers none
+   * of them, and only the listed choice values are added. The bare `agentId`
+   * entry (the agent's own default model) is always offered regardless, so an
+   * agent is never unreachable. Filtering only affects listing — hidden
+   * variants still resolve and stream (see `agent/catalog`).
+   *
+   * ACP models are deliberately absent from DSH's native model selector — see
+   * {@link AgentCatalogResult} for why that is structural, not cosmetic.
+   */
+  exposedModels?: string[]
+  /**
+   * Auto-discovery for {@link exposedModels}, ON by default: every model the
+   * agent NEWLY publishes (present in an observed catalog but absent from the
+   * one known before it) is appended to `exposedModels` automatically. It never
+   * touches models the user already had selected, and the very first catalog
+   * observation is a baseline (nothing is "new" yet). `false` is the explicit
+   * opt-out and the only value persisted; unset means "on". Flipped from the
+   * settings card's lightweight `agent/set-auto-discover-models` RPC — never by
+   * `agent/save`, which restarts the process for connection changes.
+   */
+  autoDiscoverModels?: boolean
+  /**
+   * How long this agent's process may sit READY with no live session and
+   * nothing in flight before the host releases it (kills the child). Unset →
+   * the host default (30 minutes). `0` = never release, and only agents with
+   * no live session are ever candidates (see `AgentBridge.releaseIfIdle`):
+   * probing / post-save spawns are what leak processes, since they hold no
+   * session at all. Nothing is lost either way — a released session is
+   * resumed with `session/load` on the next send.
+   */
+  idleTimeoutMs?: number
+  /**
+   * MCP servers this agent should connect to, in the plugin's NORMALIZED shape
+   * (see {@link AcpMcpServerDef}) — not the ACP wire shape.
+   *
+   * WHY A NORMALIZED SHAPE: the ACP wire union is asymmetric — its stdio
+   * variant carries NO `type` field while http/sse do, and `env`/`headers` are
+   * `[{name,value}]` arrays. A hand-written config that guessed the wire
+   * shape wrong is accepted by the agent and then SILENTLY DROPPED (measured:
+   * a stdio entry carrying `type:'stdio'` never connects). The normalized
+   * shape has one explicit discriminant, so the wire conversion happens in
+   * exactly one place (bridge.ts) and TypeScript checks it against the SDK's
+   * `McpServer` union.
+   *
+   * An agent's OWN MCP configuration (e.g. `~/.codebuddy/.mcp.json`) is read
+   * by the agent itself and needs no declaration here — this field only adds
+   * servers ON TOP of that.
+   */
+  mcpServers?: AcpMcpServerDef[]
+}
+
+/** How an MCP server is reached. `acp` (agent→client `mcp/message`) is NOT supported. */
+export type AcpMcpTransport = 'stdio' | 'http' | 'sse'
+
+/**
+ * One MCP server, in the plugin's normalized shape.
+ *
+ * The ACP-transport variant (agent calls back into the client over
+ * `mcp/message`) is deliberately absent: the client side of that method is
+ * not in the ACP SDK's stable surface, and no agent advertises the
+ * capability. `validateAgentDef` rejects it with that reason.
+ */
+export type AcpMcpServerDef =
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'stdio'
+    /** Executable to spawn for this server. */
+    command: string
+    /** Arguments for the command. */
+    args?: string[]
+    /** Environment for the server process (layered over the agent's own env). */
+    env?: Record<string, string>
+  }
+  | {
+    /** Namespaces the agent's tools as `mcp__<name>__<tool>`; unique per agent. */
+    name: string
+    transport: 'http' | 'sse'
+    /** The server's URL. */
+    url: string
+    /** Extra request headers (e.g. authorization). */
+    headers?: Record<string, string>
+  }
+
+export interface AcpPluginConfig {
+  agents: AcpAgentDef[]
+  /** Per-session transcript ring bound (default 600 entries). */
+  transcriptMaxEntries?: number
+  /**
+   * DEAD CONFIG — nothing in this plugin reads it. `validateConfig` still
+   * accepts it and the host entry still threads it into the `BridgeManager`
+   * constructor, but boot no longer probes (`bootstrapCatalogs` is
+   * intentionally empty) and `agent/catalog` is pure memory, so there is no
+   * automatic spawn left for it to switch off. Catalogs fill only from a
+   * gesture: the agent's own `session/new` / `session/load`, the settings
+   * card's `agent/probe-models` button, or an on-disk cache. Kept only so
+   * that removing it can be a separate cross-file change (impl.ts, bridge.ts
+   * and the host entry all touch it today).
+   */
+  probeModelsOnBoot?: boolean
+  /**
+   * Budget for one agent startup step (`initialize`, `session/new`, and the
+   * `session/load` of a resume). An agent that does not answer within this
+   * window is killed and the request fails with `agent_timeout` instead of
+   * hanging forever. Default 60000 ms.
+   */
+  startupTimeoutMs?: number
+  /**
+   * How long a permission ask may sit unanswered before the deadline fires.
+   *
+   * ONE window for both places an ask can live — the conversation's approval
+   * card and the settings panel's ledger. They ask the same question ("is
+   * anyone there?"), so they get the same answer; two windows only made the
+   * settings card look like two unrelated knobs.
+   *
+   * `0` means 不等待 — the ask is settled the moment it arrives, without asking
+   * anyone. That rung belongs to the `auto` MODE: it answers the ask, so the
+   * agent continues. Under `abort` the same zero would refuse every ask on
+   * arrival (the agent stops at every gate), so `abort` never runs it — the
+   * host normalizes it to the shortest real wait. Never expiring is the `wait`
+   * MODE's business, so the two never overlap. Anything else is the wait
+   * before the deadline fires. Default 300000 ms (5 minutes).
+   *
+   * When it fires, {@link AcpPluginConfig.permissionTimeoutMode} decides what
+   * happens.
+   *
+   * Editable from the settings page (`ui/approval-deadlines-set`), which
+   * persists an override in the plugin's own state file and applies it to the
+   * running bridges without restarting anything; the value here is the
+   * deployment baseline that override falls back to. See {@link AcpApprovalDeadlines}.
+   */
+  permissionTimeoutMs?: number
+  /**
+   * How long a chat process may sit idle before it is released (parked, then
+   * resumed by the next message). In MILLISECONDS; default 1800000 (30 min).
+   *
+   * This is the HOST DEFAULT: an agent that names its own
+   * {@link AcpAgentDef.idleTimeoutMs} keeps its own. Editable from the
+   * settings page (「进程管理」 → `ui/idle-release-set`), which persists an
+   * override in the plugin's own state file and applies it to the running
+   * bridges without restarting anything; the value here is the deployment
+   * baseline that override falls back to. See {@link AcpIdleRelease}.
+   */
+  idleTimeoutMs?: number
+  /**
+   * LEGACY: the old conversation-route window, kept so an existing
+   * `cordis.patch.yml` still says what it meant. Folded into
+   * {@link AcpPluginConfig.permissionTimeoutMs} when that key is absent, and
+   * ignored when it is present.
+   */
+  nativeApprovalTimeoutMs?: number
+  /**
+   * LEGACY: the old ledger-route window, kept for the same reason as
+   * {@link AcpPluginConfig.nativeApprovalTimeoutMs}.
+   */
+  permissionFallbackTimeoutMs?: number
+  /**
+   * What an expired approval deadline DOES. `wait` (default) never expires
+   * at all; `abort` answers `cancelled`; `auto` answers with the option the
+   * agent's own kinds imply and lets the agent continue.
+   *
+   * The default is `wait`: a permission ask is a question FOR A HUMAN, and
+   * refusing it because the human looked away is worse than waiting — the
+   * ask stays visible, so nobody is left wondering. `abort` and `auto` are
+   * opt-in for deployments that would rather have a bounded turn.
+   *
+   * `auto` is unattended operation — the plugin may approve something no human
+   * looked at — so it is opt-in and the outcome is announced. `wait` is the
+   * "hang visibly until I come back" mode: the ask stays pending and the turn
+   * stays open.
+   *
+   * Editable from the settings page, like {@link nativeApprovalTimeoutMs}.
+   */
+  permissionTimeoutMode?: PermissionTimeoutMode
+  /**
+   * After `session/cancel`, how long to wait for the agent to settle the turn
+   * before the host force-finalizes it. An agent that ignores the cancel
+   * notification must not wedge the session in `running` forever.
+   * Default 15000 ms; `0` disables the fallback.
+   */
+  cancelFallbackMs?: number
+  /**
+   * How long to wait before resending a prompt the agent answered with
+   * `cancelled` although no cancel was requested for that turn. Some agents
+   * (observed on codebuddy 2.161.4) clean up cancel state asynchronously, and
+   * a prompt landing inside that cleanup window is answered with `cancelled`
+   * without generating a turn — the user's message is silently swallowed.
+   * The delay must outlast the agent's cleanup window. Default 600 ms.
+   */
+  staleCancelRetryDelayMs?: number
+  /**
+   * How many times a stale-cancelled prompt is resent before the host gives
+   * up and reports the `cancelled` stop as-is. Default 2.
+   */
+  staleCancelMaxRetries?: number
+  /**
+   * Inactivity watchdog for a turn the agent owes an answer: how long the turn
+   * may stay SILENT before the host finalizes it as stalled.
+   *
+   * The clock is `LiveSession.lastAgentActivityAt`, refreshed by ANY
+   * `session/update`, at every turn start, at each segment start (the host
+   * handing the turn back after a card), and when a permission ask arrives or
+   * is resolved. The watchdog only READS it while the turn is watched: an OPEN
+   * agent segment (always true on the `/acp`-RPC path, which has no driver
+   * stream) and no pending approval. The host-card execution phase and an
+   * unanswered ask are exempt by that gate, not because the clock is frozen —
+   * they legitimately move it too.
+   *
+   * Firing finalizes the TURN only (an `agent/notice` plus the usual turn
+   * end); it does NOT kill the agent process. The wedged `session/prompt` is
+   * abandoned, and the next message reclaims the session: parked with
+   * `releaseAll` and resumed with `session/load`, or reset outright when the
+   * agent declares no `loadSession` (the context is gone and the user is
+   * told).
+   *
+   * Default 600000 ms (10 minutes); `0` disables the WHOLE watchdog, the tool
+   * window included.
+   */
+  turnStallMs?: number
+  /**
+   * The longer silence window applied while ANY ACP tool call is still active
+   * by `toolCallId` — parallel calls are tracked as a set, so the window lasts
+   * until the LAST of them finishes. The agent is working on its own clock in
+   * there, so the plain turn window would call a healthy long-running tool
+   * stalled.
+   *
+   * Default 1800000 ms (30 minutes); `0` falls back to
+   * {@link AcpPluginConfig.turnStallMs}. It matches
+   * `TOOL_OUTPUT_WAIT_MS = 30 * 60 * 1000` in `presets/acp/acp-guard.mjs`, so
+   * the two halves of one turn agree on how long a tool may take.
+   */
+  turnStallToolMs?: number
+  /**
+   * How often the watchdog scans for silent turns, in milliseconds. A tuning /
+   * test knob only: NO settings-page control exists for it — and none for the
+   * two windows above either; the whole watchdog is configured in the patch
+   * file. Default 30000 ms.
+   */
+  turnStallTickMs?: number
+}
+
+// ---- Host → browser events (`/api/acp/stream`, SSE) ----
+
+export type AgentProcessState = 'stopped' | 'starting' | 'ready' | 'error'
+
+/** Agent facts the browser may render (never includes env/argv secrets beyond argv itself, which is config-visible). */
+/**
+ * State of the ACP-mode agent preset in the HARNESS's own preset roster.
+ *
+ * Nothing is installed any more: the preset ships as this package's bundle
+ * patch (`presets/acp/acp.patch.yml`), which the harness composes when it
+ * builds the profile, so the only question left is whether the roster carries
+ * the declaration and can compose a session from it — which is exactly what a
+ * `preset-<id>` row that failed to activate reports as `problem`.
+ */
+export interface AcpPresetStatus {
+  /** Preset id (a session's `agentPreset` value; matched by the browser half). */
+  id: string
+  /** The declaration inside this package, for copy and debugging. */
+  source: string
+  /** Whether the roster carries the preset and it can compose a session. */
+  installed: boolean
+  /** The harness's own diagnostic when the declaration exists but is unusable. */
+  problem?: string
+}
+
+export interface AgentView {
+  id: string
+  title: string
+  command: string
+  args: string[]
+  cwd?: string
+  allowedCwdRoots: string[]
+  state: AgentProcessState
+  /** Last stderr lines when state is `error` (diagnostics). */
+  stderrTail?: string[]
+  /** `initialize` result, once the process is ready. */
+  agentInfo?: { name?: string; title?: string; version?: string }
+  agentCapabilities?: unknown
+  liveSessions: string[]
+  /**
+   * The window the host actually honors for this agent (its own
+   * `idleTimeoutMs`, else the host default). Resolved, not raw, so the panel
+   * can show a concrete number instead of guessing at a default; `0` = never
+   * released. Absent on an older host half.
+   */
+  idleTimeoutMs?: number
+}
+
+/**
+ * Why the host released a session's agent process. The browser turns this into
+ * one runtime-log line per cause; `idle` and `shutdown` stay silent (both are
+ * expected lifecycle transitions, not faults).
+ */
+export type AcpReleaseCause = 'idle' | 'workspace' | 'resume-failed' | 'stalled' | 'died' | 'shutdown'
+
+export type AcpEvent =
+  | { type: 'agent/status'; agentId: string; state: AgentProcessState; error?: string; agent?: AgentView }
+  | { type: 'agent/notice'; agentId: string; level: 'info' | 'error'; text: string }
+  | { type: 'session/created'; sessionId: string; session: SessionView }
+  | { type: 'session/meta'; sessionId: string; session: SessionView }
+  | { type: 'session/closed'; sessionId: string; reason: 'closed' | 'agent-stopped' | 'agent-died' }
+  | {
+    /** The agent process died: the session is kept resumable, not destroyed. */
+    type: 'session/released'
+    sessionId: string
+    session: SessionView
+    reason: string
+    /** Host's release-cause classification; absent on an older host half. */
+    cause?: AcpReleaseCause
+  }
+  | {
+    /**
+     * The session was resumed through `session/load` on a fresh agent
+     * process; the agent replays its history as fresh `session/update`s, so
+     * the browser must drop local blocks and the seq watermark first.
+     */
+    type: 'session/reset'
+    sessionId: string
+    session: SessionView
+  }
+  | { type: 'session/update'; sessionId: string; seq: number; update: SessionUpdate }
+  /**
+   * One agent's learned surface changed on the host because a real session
+   * published new `configOptions` or `availableCommands` (its `session/new` /
+   * `session/load`, a `config_option_update`, or an
+   * `available_commands_update`). The browser must drop its cached seat
+   * catalog for that agent and re-read `agent/catalog`; without this, a
+   * conversation opened before the agent's first real session keeps rendering
+   * yesterday's model list (user report, 2026-10-19) — and a conversation
+   * opened after it would miss the agent's slash commands until a reload.
+   */
+  | { type: 'catalog/updated'; agentId: string; updatedAt: number }
+  /**
+   * One agent's model visibility changed outside `agent/save`: the settings
+   * panel edited `exposedModels`, the auto-discovery switch was flipped, or an
+   * observed catalog contributed newly published models. The browser patches
+   * its copy of the agent definition (the settings card) and re-reads
+   * `agent/catalog` (the composer's seat list). `exposedModels: []` means the
+   * same as unset — no `agentId@choice` variants.
+   */
+  | { type: 'agent/exposure'; agentId: string; exposedModels: string[]; autoDiscoverModels: boolean }
+  /**
+   * One outstanding ask, broadcast ONCE when it is created and replayed as-is
+   * to every freshly connected client (see `permission/synced`).
+   *
+   * Every ACP permission ask carries everything the conversation card needs:
+   * who owns it (`dshSessionId`), what it is about (`toolCall` + the derived
+   * `toolName` / `reason`), the options to render verbatim, and the deadline in
+   * force. The host never answers on its own outside an expired `abort` /
+   * `auto` deadline, so this frame (and its replay) is the answer entry.
+   */
+  | {
+      type: 'permission/request'
+      requestId: string
+      /** ACP session id the ask belongs to. */
+      sessionId: string
+      /** DSH chat session id; absent for `/acp` RPC-only sessions. */
+      dshSessionId?: string
+      /** Raw ACP `ToolCallUpdate` the agent sent — never summarized away. */
+      toolCall: unknown
+      /** Host-derived human name (`permissionToolName`, `_meta` fallback included). */
+      toolName: string
+      /** One-line detail from the agent's declared input, when it has any. */
+      reason?: string
+      options: PermissionOptionView[]
+      /** What an unanswered ask does when its deadline fires. */
+      timeoutMode: PermissionTimeoutMode
+      /** Epoch ms of the deadline; absent in `wait` mode (no deadline). */
+      deadlineAt?: number
+    }
+  | { type: 'permission/resolved'; requestId: string; sessionId: string; outcome: PermissionOutcome }
+  /**
+   * An ask whose deadline fired and was settled by the plugin itself — refused
+   * (`abort`), or answered with the option the agent's own kinds imply
+   * (`auto`).
+   *
+   * This is the conversation's record of the expiry: the card it was answering
+   * is gone, so without this frame the user would see it vanish with nothing
+   * said about it.
+   */
+  | {
+      type: 'permission/expired'
+      sessionId: string
+      toolCall: unknown
+      /** How long the ask waited before the deadline fired. */
+      timeoutMs: number
+      /** What the plugin answered with. */
+      outcome: PermissionOutcome
+      /** The picked option's label, when one was picked (`auto` mode). */
+      optionName?: string
+    }
+  /**
+   * Terminator of the pending-permission REPLAY a freshly connected client
+   * receives (see the `/api/acp/stream` route). A `permission/request` frame is
+   * broadcast once, when the ask is created — a client that connects later (page
+   * reload, a second tab, a stream outage) would otherwise never learn the ask
+   * exists, and the settings-panel ledger card is the only answer entry for it.
+   * The replay re-sends every outstanding ask and then this frame, whose
+   * `requestIds` is the authoritative live set: the client drops any pending ask
+   * of its own that is not in it (one resolved while it was disconnected).
+   */
+  | { type: 'permission/synced'; requestIds: string[] }
+  | { type: 'turn/start'; sessionId: string; turnId: string; text: string }
+  | {
+      type: 'turn/metrics'
+      /** ACP session id (the store keys live burst state by it). */
+      sessionId: string
+      /** DSH chat session id (routing/context only). */
+      dshSessionId: string
+      turnId: string
+      /** Session aggregate INCLUDING the current turn when measurable. */
+      outputTokens: number
+      burstMs: number
+      final: boolean
+    }
+  | { type: 'turn/end'; sessionId: string; turnId: string; stopReason?: string; error?: string }
+  /**
+   * One ACP-dispatched worker became active/inactive in the host's
+   * EXTERNAL subagent catalog. `childId` is the catalog id
+   * (`acp:<toolCallId>`); the browser merges it into the host's own
+   * status map so the host's dot can read it.
+   */
+  | {
+      type: 'subagents/update'
+      /** DSH chat session id that owns the catalog row. */
+      dshSessionId: string
+      childId: string
+      running: boolean
+    }
+  /**
+   * A DSH chat conversation was locked to its agent at the start of its first
+   * ACP turn. Addressed by the CHAT session id (the browser may not know the
+   * ACP session yet). The composer plays its base→tag hand-off on this frame;
+   * a `session/chat-list` read is only the fallback (it can arrive a turn late).
+   */
+  | { type: 'chat/agent-locked'; dshSessionId: string; agentId: string }
+  /**
+   * The provisional lock of a first turn that delivered no visible output was
+   * rolled back: the conversation may switch agents again, and its base must
+   * return. The failed ACP session is closed with it.
+   */
+  | { type: 'chat/agent-unlocked'; dshSessionId: string }
+
+export interface PermissionOptionView {
+  optionId: string
+  name: string
+  kind: string
+}
+
+export type PermissionOutcome = { outcome: 'selected'; optionId: string } | { outcome: 'cancelled' }
+
+/** Plugin-side measurable burst aggregate for one ACP session (not host turn timings). */
+export interface SessionBurst {
+  /** Sum of estimated output tokens over measurable turns. */
+  outputTokens: number
+  /** Sum of within-burst chunk gaps over those turns; tool/approval/long pauses excluded. */
+  burstMs: number
+}
+
+/** Derived session snapshot for replay/reconnect (source of truth stays in the transcript). */
+export interface SessionView {
+  sessionId: string
+  agentId: string
+  acpSessionId: string
+  cwd: string
+  title?: string
+  modes?: { currentModeId?: string; availableModes?: Array<{ id: string; name?: string; description?: string }> }
+  configOptions?: unknown[]
+  /** The agent's slash commands, every field it declared — not just the two the picker draws. */
+  availableCommands?: Array<{ name: string; description?: string; [key: string]: unknown }>
+  plan?: unknown[]
+  usage?: { used: number; size: number; cost?: { amount: number; currency: string } }
+  /** Measurable burst aggregate over this session's turns; absent until measured. */
+  burst?: SessionBurst
+  running: boolean
+  closed: boolean
+  /**
+   * The owning agent process died and the session awaits a `session/load`
+   * resume. Resuming happens implicitly on the next prompt ("send to
+   * recover") when the agent declares the `loadSession` capability.
+   */
+  released?: boolean
+  /**
+   * The agent-side session has history while the local buffer is empty: the
+   * record was restored from disk after a host restart (the `session/load`
+   * replay has not landed), or a resume cleared the buffer ahead of the
+   * replay. The ACP view then says history replays on restore instead of
+   * claiming "nothing yet".
+   */
+  hasHistory?: boolean
+  /** Highest transcript seq included in this snapshot (for gap detection). */
+  seq: number
+}
+
+// ---- Browser → host RPC (`/acp` channel; payloads below) ----
+
+export type RpcResult<T> = {
+  ok: true
+  value: T
+} | {
+  ok: false
+  /** Mirrors the host `ConnectionRpcFailure` shape (details is transport-mandated). */
+  error: { code: string; message: string; details: object }
+}
+
+export interface AgentsListResult {
+  agents: AgentView[]
+}
+export type SessionPromptResult = { accepted: true; turnId: string }
+export type TranscriptResult = { session: SessionView; entries: Array<{ seq: number; update: SessionUpdate }> }
+export type SessionsListResult = { sessions: SessionView[] }
+
+/**
+ * One ACP agent session currently backing a DSH chat session, looked up by the
+ * chat session id the composer already knows. This is what lets the browser
+ * expose an agent's OWN mode list, model, thought level AND slash commands in
+ * the conversation (the ACP-native controls), independently of DSH's model
+ * selection and command catalog.
+ */
+export interface ChatSessionView {
+  agentId: string
+  /** Display name of the agent definition, when it differs from the id. */
+  agentTitle?: string
+  /** Host-minted session id (stable across an agent restart). */
+  sessionId: string
+  title?: string
+  /**
+   * The adapter model id this session was last aligned to
+   * (`agentId` / `agentId@choice`), as recorded by the host half. Absent until
+   * the first turn or an explicit switch.
+   */
+  modelId?: string
+  /** The reasoning effort in force, when the agent reports one. */
+  reasoningEffort?: string
+  /** The agent's declared modes, when it has any (`session/new` / `session/load`). */
+  modes?: SessionView['modes']
+  /**
+   * The slash commands the agent declared (`available_commands_update`). The
+   * composer's `/` menu shows THESE in an ACP conversation — the host's own
+   * command catalog describes commands this runtime would execute, which the
+   * agent can never see.
+   */
+  availableCommands?: SessionView['availableCommands']
+  /**
+   * Context occupancy the agent last reported (`usage_update`): prompt-side
+   * used/size, not request tokens. Absent until the agent reports one; the
+   * browser live-patches this row from the update frames (see AGENTS/ui.md).
+   */
+  usage?: SessionView['usage']
+  /** Measurable burst aggregate over this session's turns; absent until measured. */
+  burst?: SessionView['burst']
+  /** The agent process died; the session awaits a `session/load` resume. */
+  released?: boolean
+  /** The agent is running a turn on this session right now. */
+  running?: boolean
+  /**
+   * External (ACP-dispatched) subagent catalog ids still running for this
+   * session. Seeds the browser's active set after a reload / reconnect;
+   * live updates arrive as `subagents/update` frames.
+   */
+  activeSubagents?: string[]
+  /**
+   * Whether this session's ACP agent can be forked (`session/fork`) into a
+   * child conversation, as the host computed it. The browser does not derive
+   * this itself — the capability is host knowledge (the agent's
+   * `initialize`), and the row is the one place it is delivered.
+   * `supported: false` carries the reason; no reason on `false` means the
+   * host half predates the field (treat as unsupported).
+   */
+  fork?: ChatSessionForkInfo
+}
+/**
+ * The host's per-row verdict on forking one chat session's ACP session
+ * (`ChatSessionView.fork`). Computed from the agent's LAST KNOWN
+ * `sessionCapabilities.fork` (persisted with the model catalog) plus the
+ * session's own state — the browser never reads capability bits itself.
+ */
+export interface ChatSessionForkInfo {
+  supported: boolean
+  /** Why {@link supported} is false: the agent cannot fork, or the session cannot be forked right now. */
+  reason?: 'unsupported' | 'released' | 'busy'
+}
+export type ChatSessionsListResult = { sessions: ChatSessionView[] }
+
+/**
+ * The `session/chat-list` answer: the backing ACP sessions, plus whether that
+ * DSH chat session runs the ACP agent preset (host-read from the session log).
+ * The composer surfaces fall back to the latter when the client runtime's
+ * session rows carry no `agentPreset` — on such hosts it is the only fact
+ * source they have.
+ */
+export interface ChatSessionListResult extends ChatSessionsListResult {
+  acpMode?: boolean
+  /**
+   * The agent this conversation is LOCKED to, once its first ACP turn has run.
+   *
+   * The composer's agent base retires at that point and the composer-edge tag
+   * shows this agent; the tag is display-only because a different agent would
+   * have none of the conversation's context. The lock is persisted with the
+   * conversation record, so it outlives the ACP session (and a host restart),
+   * and it is reported even when the agent is no longer in the roster — the
+   * conversation still belongs to it.
+   */
+  lockedAgentId?: string
+  /**
+   * The conversation's persisted pick (agent + model + thought level), when one
+   * exists. This is what the composer reads BEFORE the conversation has an ACP
+   * session, so a model chosen up front shows up as the current one instead of
+   * appearing to have been forgotten.
+   */
+  choice?: AcpConversationChoice
+}
+
+/**
+ * One ACP session's folded transcript, addressed by its DSH chat session.
+ *
+ * This is the data behind the conversation's ACP view tab. The native chat
+ * plane renders what the LLM adapter emits, so the agent's prose and thinking
+ * ride there — but a fuller card (a tool call with its arguments, a plan, a
+ * unified diff) has no chunk vocabulary in the adapter's output, so it is
+ * rendered here instead. This is how the browser reaches it without knowing an
+ * ACP session id up front. See docs/acp-convergence.md §1.2.
+ */
+export interface ChatTranscriptView {
+  session: SessionView
+  /**
+   * Raw ACP `session/update` payloads in seq order (the fold happens
+   * client-side). `unknown` is deliberate, matching `TranscriptResult`: the
+   * host's buffer is transport-agnostic and must not import the SDK.
+   */
+  entries: Array<{ seq: number; update: unknown }>
+}
+export type ChatTranscriptResult = { views: ChatTranscriptView[] }
+export interface ChatTranscriptPayload { dshSessionId: string; afterSeq?: number }
+
+export interface SessionStartPayload { agentId: string; cwd?: string }
+export interface SessionPromptPayload { sessionId: string; text: string }
+export interface SessionIdPayload { sessionId: string }
+export interface PermissionRespondPayload { requestId: string; optionId?: string }
+export interface SessionModeSetPayload { sessionId: string; modeId: string }
+export interface SessionConfigSetPayload { sessionId: string; configId: string; value: string | boolean }
+export interface TranscriptGetPayload { sessionId: string; afterSeq?: number }
+export interface AgentIdPayload { agentId: string }
+/**
+ * The plugin's OWN default ACP agent (the panel's ★ gesture): which agent an
+ * ACP-mode conversation starts on. Plugin-private state — the host never sees a
+ * model route here, and nothing in this plugin writes DSH's model selection
+ * (see docs/acp-convergence.md §2.2).
+ */
+export interface DefaultAgentSetPayload { agentId?: string }
+/** `default/agent`: the plugin's own default agent id, or `undefined` when unset. */
+export type DefaultAgentResult = { agentId?: string }
+/** `plugin/version`: the installed host package's version, for the settings badge. */
+export type PluginVersionResult = { version?: string }
+
+/**
+ * Where the plugin's own update check stands. The host half only ever reports
+ * facts it can read from the harness plugin manager and the npm registry — it
+ * never downloads, swaps files, or restarts itself.
+ */
+export type PluginUpdateStatus =
+  | 'unsupported' | 'not-installed' | 'source-install' | 'managed'
+  | 'current' | 'available' | 'applying' | 'busy'
+  | 'applied' | 'restart-required' | 'failed'
+
+/**
+ * One update-check answer, shared by `plugin/update-check` and
+ * `plugin/update-apply`.
+ */
+export interface PluginUpdateState {
+  status: PluginUpdateStatus
+  /** 运行中（内存里）的插件版本 */
+  current: string
+  /** 磁盘上装着的版本（listBundles().version），可读时才有 */
+  installed?: string
+  /** profile registry 链上最新的稳定版 */
+  latest?: string
+  /** latest 的 npm 发布时间 ISO */
+  publishedAt?: string
+  /** 实际按顺序问过的 registry */
+  registries?: string[]
+  /** 失败/额外说明（英文技术信息，UI 自己负责本地化） */
+  message?: string
+}
+
+/**
+ * How the composer-edge agent tag shows liveness (the blue halo). `breath`
+ * pulses the halo at the speed below; `steady` shows a constant glow.
+ * Plugin-private display preference, persisted with the agent registry.
+ */
+export interface AcpTagHalo {
+  mode: 'breath' | 'steady'
+  speed: 'slow' | 'normal' | 'fast'
+}
+/** Default when nothing was ever saved: the breathing halo at normal speed. */
+export const DEFAULT_TAG_HALO: AcpTagHalo = { mode: 'breath', speed: 'normal' }
+/** `ui/tag-halo`: read the halo preference. */
+export type TagHaloResult = { halo: AcpTagHalo }
+/** `ui/tag-halo-set`: write the halo preference. */
+export interface TagHaloSetPayload { halo: AcpTagHalo }
+
+/** The approval deadline the settings page can edit, by field name. ONE window. */
+export type ApprovalDeadlineKey = 'permissionTimeoutMs'
+
+/**
+ * The idle-release windows the settings page offers, in MILLISECONDS.
+ *
+ * ONE ladder, shared by both halves: the browser snaps its slider to these
+ * values and the host accepts only these values, so a window the slider can
+ * produce is always a window the host runs. The first rung is 1 minute (an
+ * aggressive release), the rest are 5-minute steps up to an hour.
+ */
+export const IDLE_RELEASE_MS: readonly number[] = [
+  60_000, 300_000, 600_000, 900_000, 1_200_000, 1_500_000, 1_800_000, 2_100_000, 2_400_000, 2_700_000, 3_000_000, 3_300_000, 3_600_000,
+]
+
+/**
+ * The built-in idle-release window for chat processes: 30 minutes.
+ *
+ * Lives beside the ladder it is a rung of, so the two cannot drift: a
+ * deployment that names no window of its own runs this, and the settings
+ * page's reset returns to it.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 1_800_000
+
+/**
+ * The idle-release window for chat processes, as the settings page edits it.
+ *
+ * The window is the HOST default: an agent that names its own
+ * {@link AcpAgentDef.idleTimeoutMs} keeps it, and a probe-only process (one
+ * that never hosted a session) still honors the short probe window — see
+ * `AGENTS/protocol.md` §5.
+ */
+export interface AcpIdleRelease {
+  /** The window in force, in ms. */
+  idleTimeoutMs: number
+  /**
+   * The window a RESET returns to: the deployment baseline when the config
+   * file names one, else the built-in default (30 minutes).
+   */
+  defaultIdleTimeoutMs: number
+  /**
+   * The window `cordis.patch.yml` names, when it names one. Reported only
+   * when the file actually names one: the settings card must not say "the
+   * file asks for 30 minutes" about a file that says nothing.
+   */
+  configuredIdleTimeoutMs?: number
+}
+/** `ui/idle-release`: read the idle-release window in force. */
+export type IdleReleaseResult = { idleRelease?: AcpIdleRelease }
+/**
+ * `ui/idle-release-set`: write the idle-release window, or drop the persisted
+ * override with `reset` so the built-in default applies again.
+ */
+export interface IdleReleaseSetPayload {
+  /** The window to run, in ms; omitted when `reset` is true. */
+  idleTimeoutMs?: number
+  /** Drop the persisted override so the built-in default applies again. */
+  reset?: boolean
+}
+
+/**
+ * What an EXPIRED approval deadline does. Three modes, and only three — an
+ * unanswered ask either gets answered for you, keeps waiting, or is refused.
+ *
+ * - `abort`: answer `cancelled`. The operation is refused and the agent
+ *   continues with that answer.
+ * - `auto`: answer the ask with the option the AGENT's own kinds imply
+ *   (`allow_always` → `allow_once` → `reject_once` → `reject_always` → the
+ *   first option), and the agent CONTINUES executing. This is unattended
+ *   operation: the plugin may end up approving something nobody looked at,
+ *   which is why it is opt-in and why the outcome is announced.
+ * - `wait` (default): never expire. The ask stays pending, visibly, until a
+ *   human answers it or the session is cancelled.
+ *
+ * Same three modes as OmniTerm dev's `acp_perm_timeout_mode`, under the same
+ * names. The plugin's own default is `wait`, not `abort` and not `auto`: a
+ * permission ask is a question for a human, so the safe default is to keep
+ * waiting rather than to refuse (or worse, approve) on their behalf.
+ */
+export type PermissionTimeoutMode = 'abort' | 'auto' | 'wait'
+
+/**
+ * What the settings page's approval-deadline card shows: the values in force,
+ * plus the facts that explain why a value the user did not pick is winning.
+ *
+ * `configured` is present only when `cordis.patch.yml` names a key — a settings
+ * override outranks it, and the card must say so rather than silently showing
+ * the override. `configuredMode` is the same fact about the mode.
+ */
+export interface AcpApprovalDeadlines {
+  /**
+   * The one wait window, in ms. `0` means 不等待 — the ask is settled on
+   * arrival, without asking anyone, and only the `auto` mode runs it.
+   * Never expiring is the `mode`'s business.
+   *
+   * It covers BOTH places an ask can live (the conversation's approval card
+   * and the settings panel's ledger): one question, one answer, one number.
+   */
+  permissionTimeoutMs: number
+  /** What an expired deadline does. Always present: `wait` is the default. */
+  mode: PermissionTimeoutMode
+  /** The config-file value for the window, when the file names one. */
+  configured?: Partial<Record<ApprovalDeadlineKey, number>>
+  /** The config-file baseline for `mode`, when the file names one. */
+  configuredMode?: PermissionTimeoutMode
+}
+/**
+ * `ui/approval-deadlines`: read the deadlines in force. `deadlines` is absent
+ * on a host half from before the card existed, which hides the card rather than
+ * showing a number the browser invented.
+ */
+export type ApprovalDeadlinesResult = { deadlines?: AcpApprovalDeadlines }
+/**
+ * One write to the approval-deadline settings: the window, and the mode.
+ * Omitted keys keep their current value — a card that only moved the mode
+ * must not reset the number.
+ */
+export interface ApprovalDeadlinePatch {
+  permissionTimeoutMs?: number
+  mode?: PermissionTimeoutMode
+}
+/**
+ * `ui/approval-deadlines-set`: write the deadline, or the mode.
+ * `reset: true` drops the persisted override so the `cordis.patch.yml`
+ * baseline (or the built-in default) applies again.
+ */
+export interface ApprovalDeadlinesSetPayload extends ApprovalDeadlinePatch {
+  reset?: boolean
+}
+
+/**
+ * `session/chat-bind`: point one DSH chat conversation at an ACP agent. The
+ * plugin's own conversation↔agent mapping — deliberately NOT a DSH model
+ * selection, which is what polluting the deployment default and getting
+ * refused by the GUI's catalog gate both came from.
+ */
+export interface ChatBindPayload { dshSessionId: string; agentId: string }
+/** `session/chat-model-set`: switch the bound agent's model (`agentId@choice`). */
+export interface ChatModelSetPayload { dshSessionId: string; modelId: string }
+/** `session/chat-effort-set`: switch (or clear, by omitting) the agent's effort; `agentId` names the agent a not-yet-bound conversation is served by (the plugin default). */
+export interface ChatEffortSetPayload { dshSessionId: string; effort?: string; agentId?: string }
+/** `session/chat-config-set`: set one of the agent's extra config options. */
+export interface ChatConfigSetPayload { dshSessionId: string; configId: string; value: string | boolean; agentId?: string }
+
+/**
+ * `session/chat-fork-adopt`: bind the DSH chat session a host `sessions.fork`
+ * just created to the SAME agent process, through the agent's own
+ * `session/fork` of the parent conversation's ACP session — the second half of
+ * the two-stage branch (host builds the DSH tree first, the plugin then adopts
+ * the ACP side; see the NTR message-actions plan, §D5/D7).
+ *
+ * On success the child conversation's next message reaches an agent that
+ * actually remembers the parent context. On failure NOTHING is bound: the
+ * child stays an ordinary copied-history conversation and its first message
+ * starts a fresh `session/new` (today's behavior).
+ */
+export interface ChatForkAdoptPayload { dshSessionId: string; parentDshSessionId: string }
+/** `session/chat-fork-adopt` success: the adopted ACP session's ids. */
+export type ChatForkAdoptResult = { sessionId: string; acpSessionId: string }
+
+/** Host-detected agent presence and tested defaults. */
+export interface DetectedAgentInfo {
+  id: string
+  name: string
+  description?: string
+  detected: boolean
+  executablePath?: string
+  defaultCommand: string
+  defaultArgs: string[]
+  currentConfig?: AcpAgentDef
+}
+
+export type AgentDetectResult = { agents: DetectedAgentInfo[] }
+
+export interface AgentSavePayload {
+  id: string
+  title?: string
+  command: string
+  args?: string[]
+  npmPackage?: string
+  cwd?: string
+  allowedCwdRoots?: string[]
+  env?: Record<string, string>
+  exposedModels?: string[]
+  /** Opt out of auto-discovery with `false`; absent keeps the default (on). See {@link AcpAgentDef.autoDiscoverModels}. */
+  autoDiscoverModels?: boolean
+  /** Absent → keep the host default (30 minutes); `0` = never release. */
+  idleTimeoutMs?: number
+  /** MCP servers to connect to, in the normalized shape. See {@link AcpAgentDef.mcpServers}. */
+  mcpServers?: AcpMcpServerDef[]
+}
+
+/** Result of `agent/test`: spawn + initialize a throwaway process from form values, then tear it down. */
+export interface AgentTestResult {
+  ok: boolean
+  /** Failure reason when `ok` is false (spawn ENOENT, install failure, initialize timeout, …). */
+  error?: string
+  /** The agent's `initialize` identity, when the handshake completed. */
+  agentInfo?: { name?: string; title?: string; version?: string }
+  /** Wall-clock cost of the whole test, including a triggered npm install. */
+  durationMs: number
+  /** Tail of the child's stderr (and installer output), newest last. */
+  stderr: string[]
+}
+
+export interface AgentExposedModelsPayload {
+  agentId: string
+  /** Absent → clear the filter (expose no variants); array (even empty) → expose exactly these. */
+  exposedModels?: string[]
+}
+
+// ---- Model catalog (host-side cache of ACP `configOptions`) ----
+
+/** One selectable value of a `model` / `thought_level` config option. */
+export interface AcpCatalogChoice {
+  value: string
+  name: string
+  description?: string
+  /**
+   * Label of the `SessionConfigSelectGroup` this choice arrived under
+   * (commonly the vendor); absent when the agent ships a flat option list.
+   * Deliberately never guessed from name/value — vendors cross-list models,
+   * so only the agent's own grouping is trustworthy.
+   */
+  group?: string
+}
+
+/** A parsed `category: model | thought_level` select option for one agent. */
+export interface AcpCatalogOption {
+  configId: string
+  name: string
+  /**
+   * `'boolean'` for an on/off toggle: `currentValue` is the string `'true'` /
+   * `'false'` (the catalog stays string-typed so every existing reader keeps
+   * working) and `choices` is empty. Absent means the ordinary select.
+   */
+  kind?: 'boolean'
+  /** Currently selected value at parse time (may be absent from `choices`). */
+  currentValue: string | null
+  choices: AcpCatalogChoice[]
+}
+
+/**
+ * The per-category catalog derived from one agent's `configOptions`.
+ *
+ * `mode` is the agent's own permission/working mode published as a
+ * `category: 'mode'` select. It duplicates the `modes` field of `session/new`
+ * on the agents observed so far (omp, codebuddy), but it is the only copy a
+ * conversation can read BEFORE it has a live session — which is exactly the
+ * window in which the composer must still show the control (user report,
+ * 2026-10-18: the mode select vanished on a conversation set up ahead of its
+ * first message).
+ *
+ * `extras` are the agent's REMAINING select options (temperature, vendor
+ * switches, `model_config` entries, anything unknown). They have no dedicated
+ * control in the composer, so they ride the "advanced" base to the left of the
+ * model chip. Keeping them here — rather than in the browser's raw
+ * `configOptions` — is what lets a conversation with no live session show and
+ * set them.
+ */
+export interface AcpAgentCatalog {
+  model?: AcpCatalogOption
+  thought?: AcpCatalogOption
+  mode?: AcpCatalogOption
+  extras?: AcpCatalogOption[]
+}
+
+/**
+ * Everything one DSH chat conversation has chosen for its ACP agent — the
+ * plugin's own per-conversation record, persisted with the agent registry.
+ *
+ * Every field is a PICK, not a live-session fact: a conversation can be set up
+ * before it has ever run a turn (that is the whole point — choosing the agent,
+ * model and thought level BEFORE the first message rather than discovering you
+ * cannot). Nothing here is a DSH model route (see the module header): these
+ * values are applied to the agent's `session/new` / `session/set_config_option`
+ * on the next turn, and re-applied when a session is recreated or resumed.
+ */
+export interface AcpConversationChoice {
+  /** The ACP agent serving this conversation. */
+  agentId: string
+  /**
+   * Whether this conversation has LOCKED its agent: its first ACP turn has
+   * STARTED. From then on the agent cannot be switched — a different agent has
+   * none of the context — so the composer hides its picker and the host
+   * refuses `session/chat-bind` to another agent (`agent_locked`). The lock is
+   * provisional until that turn produces a visible block: a first turn that
+   * delivers nothing is rolled back and the conversation is free again. Once
+   * delivered, the lock is permanent; start a new conversation to use another
+   * agent.
+   */
+  locked?: boolean
+  /**
+   * The agent's model as an adapter model id (`agentId` = the agent's default,
+   * `agentId@choice` = an explicit variant). Absent means "the agent's default".
+   */
+  modelId?: string
+  /** The agent's own `thought_level` value. Absent means "the agent's default". */
+  effort?: string
+  /**
+   * The agent's own working mode (`session/set_mode`: `plan` / `acceptEdits` /
+   * …). Absent means "whatever the agent starts on".
+   *
+   * This is the agent's vocabulary for HOW it works, distinct from the model and
+   * the thought level, but it sits in the same composer bar — so it belongs to
+   * the same "remember what the user last chose here" contract rather than being
+   * the one control that resets every time the process restarts.
+   */
+  mode?: string
+  /**
+   * The agent's extra `configOptions`, by `configId` (the "advanced" base).
+   * Absent means "none chosen"; individual keys absent mean "the agent's own
+   * current value". These are the same values `session/set_config_option`
+   * accepts, persisted per conversation so a pick survives a restart and is
+   * re-applied when its ACP session is recreated or resumed.
+   */
+  extraConfigs?: Record<string, string | boolean>
+}
+
+/** Result of `agent/probe-models`: the freshly probed (or cached) catalog. */
+export interface AgentProbeModelsResult {
+  agentId: string
+  catalog: AcpAgentCatalog
+  updatedAt: number
+}
+
+/** One of the agent's extra select options, shaped for the composer's advanced menu. */
+export interface AgentCatalogExtraOption {
+  configId: string
+  /** The agent's own option name (falls back to the config id host-side). */
+  name: string
+  /**
+   * `'boolean'` for an on/off toggle (`currentValue` is `'true'` / `'false'`,
+   * `choices` is empty and the composer renders a checkbox row). Absent means
+   * the ordinary select. Kept optional so cached catalogs written before
+   * toggles existed still read.
+   */
+  kind?: 'boolean'
+  /** The value the agent reports as current, when it reports one. */
+  currentValue?: string
+  choices: Array<{ id: string; name: string; description?: string }>
+}
+
+/**
+ * Result of `agent/catalog`: the ACP model surface for ONE agent.
+ *
+ * THIS IS THE ONLY PLACE ACP MODELS EXIST. DSH builds its provider/model
+ * catalog per *request*, not per session — `buildModelCatalog(ctx)` takes no
+ * session id, so every session's model directory is that same global list. A
+ * provider that advertises models therefore advertises them to every
+ * conversation, including the ones where the external agent has no tool
+ * registration, no runtime context and is not the model talking at all. The
+ * `acp` route consequently advertises nothing (`LlmAdapter.listModels` is
+ * advisory — exact ids still resolve and stream), and the plugin's own seats
+ * read this per-agent view instead. There is no per-session seam on the host
+ * to filter the global catalog with, so "advertise nothing" is the only
+ * structurally honest isolation.
+ *
+ * Read-only and memory-only: it never spawns and never starts a probe, not
+ * even for an agent with no cached catalog — that case is reported honestly
+ * (`probed: false`, `base` entry only). A catalog fills only from a gesture:
+ * the agent's own `session/new` / `session/load`, the settings card's
+ * `agent/probe-models` button, or an on-disk cache. (Boot-time probing used
+ * to exist and no longer does — see `BridgeManager.bootstrapCatalogs`.)
+ */
+export interface AgentCatalogResult {
+  agentId: string
+  /** Agent display name (`title` ?? id). */
+  title: string
+  /**
+   * The bare-`agentId` entry: the route that means "let the agent choose its own
+   * model". Its `name` spells out the model that route CURRENTLY resolves to
+   * (`<agent> · <model>`) — the bare route is not a model, so naming it after the
+   * agent alone left the checked row in the picker saying nothing about which
+   * model was in force.
+   */
+  base: { id: string; name: string; description?: string }
+  /** The `agentId@choice` variants this agent exposes (`exposedModels` applied). */
+  variants: Array<{ id: string; name: string; description?: string }>
+  /**
+   * Reasoning efforts from the agent's own `thought_level` option, when it
+   * advertises one. Agent-wide by construction (a thought level is not a
+   * property of one model), which is why it rides here and not on `variants`.
+   */
+  reasoning?: LlmModelReasoningInfo
+  /**
+   * The model the agent itself reports as selected (`model.currentValue`).
+   *
+   * This is what the model chip shows for a conversation that has not picked
+   * anything yet: without it the chip has no label and therefore does not
+   * render at all, so an agent the user simply has not tuned yet looks like an
+   * agent with no model axis (user report, 2026-10-18). Its absence is
+   * meaningful — an agent that publishes no `category: 'model'` select has no
+   * model axis, and the chip stays away.
+   *
+   * NOTE the difference from `base`: `base` is a ROUTE (bare `agentId`), this is
+   * a MODEL VALUE (a choice id). The picker needs both — one to name the route,
+   * one to mark the row the conversation is actually on.
+   */
+  currentModel?: { value: string; name: string; description?: string }
+  /**
+   * The agent's own MODE options (`category: 'mode'`, e.g. codebuddy's
+   * `Always Ask` … `Bypass Permissions`).
+   *
+   * The live composer select reads the `modes` field of `session/new` /
+   * `session/load`; this copy exists for the window before one exists. It is
+   * the same list on every agent observed so far (omp, codebuddy), and it is
+   * the only source a conversation set up ahead of its first message has.
+   */
+  mode?: {
+    /** The agent's current mode id, when it reports one. */
+    currentValue?: string
+    choices: Array<{ id: string; name: string; description?: string }>
+  }
+  /**
+   * The agent's remaining select options — everything that is not the model,
+   * the thought level, or the mode. Empty/absent means the composer shows no
+   * advanced base.
+   */
+  extras?: AgentCatalogExtraOption[]
+  /**
+   * The slash commands this agent declared in its most recent session
+   * (`available_commands_update`), cached per agent.
+   *
+   * A live session reports its own list through `session/chat-list`, and that
+   * one always wins. This copy exists for the window BEFORE a conversation has
+   * an ACP session: typing `/` in a fresh NTR conversation must list the
+   * agent's commands, the way the native menu lists DSH's — waiting for the
+   * first message to discover them is what makes the menu look empty.
+   */
+  commands?: SessionView['availableCommands']
+  /** When those commands were last observed. */
+  commandsUpdatedAt?: number
+  /** A probe has produced a catalog for this agent (`false` → base entry only). */
+  probed: boolean
+  /** When the cached catalog was last refreshed. */
+  updatedAt?: number
+}
+
+// ---- LLM Streaming & Adapter types (shared with DSH core LLM service) ----
+
+export interface LlmModelInfo {
+  provider: string
+  id: string
+  name: string
+  description?: string
+  inputModalities?: readonly string[]
+}
+
+/** One reasoning effort advertised by a model (mirrors DSH `LlmReasoningEffortInfo`). */
+export interface LlmReasoningEffortInfo {
+  id: string
+  name: string
+  description?: string
+}
+
+/** Reasoning metadata (mirrors DSH `LlmModelReasoningInfo`): `defaultEffort` must be one of `efforts`. */
+export interface LlmModelReasoningInfo {
+  efforts: readonly LlmReasoningEffortInfo[]
+  defaultEffort?: string
+}
+
+export interface LlmResolvedModelInfo extends LlmModelInfo {
+  context?: { contextWindow: number }
+  defaultMaxTokens?: number
+  reasoning?: LlmModelReasoningInfo
+}
+
+export interface LlmProviderInfo {
+  id: string
+  name: string
+}
+
+export type StreamChunk =
+  | { type: 'block-start'; index: number; blockType: 'text' | 'reasoning' | 'tool-call' | 'tool-result' }
+  | { type: 'text-delta'; index: number; text: string }
+  | { type: 'reasoning-delta'; index: number; text: string }
+  | { type: 'tool-call-delta'; index: number; id: string; name?: string; argumentsDelta: string }
+  | { type: 'block-end'; index: number; block: unknown }
+  | { type: 'usage'; usage: { inputTokens: number; outputTokens: number } }
+  | {
+    type: 'finish'
+    reason:
+      | { kind: 'stop' }
+      | { kind: 'aborted'; failure?: { message: string; code: string } }
+      | { kind: 'error'; failure?: { message: string; code: string } }
+  }
+
+/**
+ * Provenance of one message in a host-built request. The host tags every
+ * message, and the tag is the only way to tell the user's own words apart from
+ * the context sections the harness injects around them (`agent-instructions`,
+ * `skill-catalog`, the `@deepseek-ai/dsh-system-prompt` runtime snapshot, tool
+ * results) — see AGENTS.md rule 16.
+ */
+export interface GenerateMessageSource {
+  kind?: string
+  plugin?: string
+  form?: string
+  [k: string]: unknown
+}
+
+export interface GenerateMessage {
+  role: 'system' | 'user' | 'assistant'
+  content: Array<{ type: string; text?: string; [k: string]: unknown }>
+  /** Host provenance; absent sources are treated as real user input (hand-built callers). */
+  source?: GenerateMessageSource
+  /** Stable identity of the durable message, when the host built the request from a session log. */
+  id?: string
+}
+
+export interface GenerateOptions {
+  provider: string
+  model: string
+  /** Adapter-owned reasoning effort selected for this exact model. */
+  reasoningEffort?: string
+  messages: GenerateMessage[]
+  system?: string
+  signal?: AbortSignal
+  sessionId?: string
+  /**
+   * Auxiliary (non-conversation) call classification, e.g. `session-title` or
+   * `compaction`. Ordinary turns leave it unset; an ACP bridge must never turn
+   * one of these into a remote agent turn.
+   */
+  purpose?: string
+}
+
+export interface PreparedAdapterCall {
+  readonly model: LlmResolvedModelInfo
+  stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+}
+
+export interface LlmAdapterLike {
+  providerInfo?(provider: string): LlmProviderInfo
+  providerRetryPolicy?(provider: string): unknown
+  imageRequestPricing?(provider: string, model: string): unknown
+  listModels?(provider: string): Promise<readonly LlmModelInfo[]>
+  resolveModel?(provider: string, model: string, signal?: AbortSignal): Promise<LlmResolvedModelInfo>
+  prepareCall?(provider: string, model: string, signal?: AbortSignal): Promise<PreparedAdapterCall>
+  stream(options: GenerateOptions): AsyncIterable<StreamChunk>
+}
+

@@ -1,0 +1,16 @@
+{
+  "name": "@local/dsh-image-resolver",
+  "version": "0.2.0",
+  "private": true,
+  "description": "AsyncImage-style host route for DSH GenUI: /img-resolve?q=<description> answers 302 to a resolved image URL (14 sources via dsh-image-hunt, Wikimedia fallback).",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "README.md"
+  ]
+}
